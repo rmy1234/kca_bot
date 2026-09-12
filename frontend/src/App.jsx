@@ -177,7 +177,7 @@ function App() {
 
   return <div className="app-layout">
     <aside className="sidebar">
-      <div className="brand"><span className="brand-mark">K</span><span>KCA Study</span></div>
+      <button className="brand brand-button" onClick={() => navigate('dashboard')}><span className="brand-mark">K</span><span>KCA Study</span></button>
       <p className="sidebar-label">학습 공간</p>
       <nav className="sidebar-nav">
         <SideItem icon="⌂" label="대시보드" active={view === 'dashboard'} onClick={() => navigate('dashboard')} />
@@ -188,8 +188,10 @@ function App() {
         {currentUser.is_admin && <SideItem icon="▣" label="콘텐츠 관리" active={view === 'content'} onClick={() => navigate('content')} />}
       </nav>
       <div className="sidebar-bottom">
-        <span className="avatar">{currentUser.name.slice(0, 1)}</span>
-        <div><strong>{currentUser.name}</strong><small>{currentUser.is_admin ? '관리자' : '정보보안기사 준비'}</small></div>
+        <button className="sidebar-profile" onClick={() => navigate('profile')} aria-current={view === 'profile' ? 'page' : undefined}>
+          <span className="avatar">{currentUser.name.slice(0, 1)}</span>
+          <div><strong>{currentUser.name}</strong><small>{currentUser.is_admin ? '관리자' : '정보보안기사 준비'}</small></div>
+        </button>
         <button className="text-button" onClick={logout}>로그아웃</button>
       </div>
     </aside>
@@ -203,6 +205,7 @@ function App() {
       {view === 'wrong' && <WrongNotes notes={wrongNotes} retry={retryWrong} retrySame={retrySame} />}
       {view === 'stats' && <Stats stats={stats} />}
       {view === 'content' && currentUser.is_admin && <ContentManager subjects={subjects} onError={showError} />}
+      {view === 'profile' && <Profile user={currentUser} onUpdate={setCurrentUser} />}
       </div>
       {error && <p className="error">{error}</p>}
     </main>
@@ -254,7 +257,7 @@ function ModelBanner({status}) {
   const retryAt = new Date(status.fallback_until).toLocaleTimeString('ko-KR', {hour: '2-digit', minute: '2-digit'})
   return <div className="model-banner" role="status"><span aria-hidden="true">⚠</span><div><strong>AI 모델이 로컬 모델로 자동 전환되었습니다.</strong><br />{status.fallback_reason} 지금은 {status.fallback_model}(으)로 문제를 만들고, {retryAt} 이후 {status.primary_model}을(를) 다시 시도합니다.</div></div>
 }
-function viewTitle(view) { return ({dashboard: '대시보드', solve: '문제 풀기', essay: '실기 모드', wrong: '오답 노트', stats: '학습 통계', content: '콘텐츠 관리'})[view] }
+function viewTitle(view) { return ({dashboard: '대시보드', solve: '문제 풀기', essay: '실기 모드', wrong: '오답 노트', stats: '학습 통계', content: '콘텐츠 관리', profile: '내 계정'})[view] }
 function SideItem({icon, label, active, badge, onClick}) { return <button className={'side-item ' + (active ? 'active' : '')} aria-current={active ? 'page' : undefined} onClick={onClick}><span>{icon}</span>{label}{badge > 0 && <b>{badge}</b>}</button> }
 
 function Dashboard({stats, wrongNotes, queue, onNavigate, onTopic}) {
@@ -331,5 +334,57 @@ function ContentManager({subjects, onError}) {
 }
 
 function statusLabel(status) { return ({'처리중': '처리중', '완료': '완료', '실패': '실패'})[status] || status }
+
+function Profile({user, onUpdate}) {
+  const [name, setName] = useState(user.name)
+  const [email, setEmail] = useState(user.email || '')
+  const [currentPassword, setCurrentPassword] = useState('')
+  const [newPassword, setNewPassword] = useState('')
+  const [confirmPassword, setConfirmPassword] = useState('')
+  const [busy, setBusy] = useState(false)
+  const [message, setMessage] = useState('')
+  const [error, setError] = useState('')
+
+  const emailChanged = email !== (user.email || '')
+  const wantsPasswordChange = newPassword.length > 0
+  const needsCurrentPassword = emailChanged || wantsPasswordChange
+
+  async function submit(event) {
+    event.preventDefault()
+    setError(''); setMessage('')
+    if (wantsPasswordChange && newPassword !== confirmPassword) return setError('새 비밀번호가 서로 일치하지 않습니다.')
+    const payload = {}
+    if (name !== user.name) payload.name = name
+    if (emailChanged) payload.email = email
+    if (wantsPasswordChange) payload.new_password = newPassword
+    if (needsCurrentPassword) payload.current_password = currentPassword
+    if (Object.keys(payload).length === 0) return setMessage('변경된 내용이 없습니다.')
+    setBusy(true)
+    try {
+      const updated = await request('/users/me', {method: 'PATCH', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(payload)})
+      onUpdate(updated)
+      setCurrentPassword(''); setNewPassword(''); setConfirmPassword('')
+      setMessage('저장했습니다.')
+    } catch (err) { setError(err.message || '저장하지 못했습니다.') } finally { setBusy(false) }
+  }
+
+  return <section className="content-card profile-card">
+    <p className="card-label">ACCOUNT</p>
+    <h2>내 계정</h2>
+    <form className="profile-form" onSubmit={submit}>
+      <label>이름<input value={name} onChange={(e) => setName(e.target.value)} minLength={1} maxLength={120} required /></label>
+      <label>이메일<input type="email" value={email} onChange={(e) => setEmail(e.target.value)} required /></label>
+      {needsCurrentPassword && <label>현재 비밀번호<input type="password" value={currentPassword} onChange={(e) => setCurrentPassword(e.target.value)} placeholder="이메일 또는 비밀번호를 바꾸려면 입력하세요" required /></label>}
+      <div className="profile-password-change">
+        <p className="card-label">비밀번호 변경</p>
+        <label>새 비밀번호<input type="password" value={newPassword} onChange={(e) => setNewPassword(e.target.value)} placeholder="8자 이상 · 바꾸지 않으려면 비워두세요" minLength={8} maxLength={200} /></label>
+        {wantsPasswordChange && <label>새 비밀번호 확인<input type="password" value={confirmPassword} onChange={(e) => setConfirmPassword(e.target.value)} required /></label>}
+      </div>
+      <button className="primary-action" disabled={busy}>{busy ? '저장 중...' : '저장'}</button>
+      {message && <p className="profile-message" role="status">{message}</p>}
+      {error && <p className="error">{error}</p>}
+    </form>
+  </section>
+}
 
 export default App

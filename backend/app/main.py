@@ -25,7 +25,7 @@ from app.schemas import (
     EssayFeedbackResponse, EssayHistoryItem, EssayQuestionResponse, EssaySubmitRequest,
     AdminTopicRequest, DocumentDetailResponse, DocumentEmbeddingResponse, ReassignEmbeddingRequest,
     ReferenceQuestionRequest, ReferenceQuestionResponse, SourceDocumentResponse,
-    LoginRequest, RegisterRequest, TokenResponse, UserResponse,
+    LoginRequest, RegisterRequest, TokenResponse, UpdateProfileRequest, UserResponse,
 )
 from app.seed import seed_curriculum
 from app.srs.sm2 import SM2State, update_sm2
@@ -74,6 +74,30 @@ async def login(request: LoginRequest, db: AsyncSession = Depends(db_session)):
 @app.get("/auth/me", response_model=UserResponse, tags=["auth"])
 async def read_current_user(current_user: User = Depends(get_current_user)):
     return current_user
+
+@app.patch("/users/me", response_model=UserResponse, tags=["auth"])
+async def update_profile(request: UpdateProfileRequest, db: AsyncSession = Depends(db_session), current_user: User = Depends(get_current_user)):
+    wants_email_change = request.email is not None and request.email != current_user.email
+    wants_password_change = request.new_password is not None
+    # A name-only change needs no confirmation; email or password changes do.
+    if wants_email_change or wants_password_change:
+        if not request.current_password or not current_user.password_hash or not verify_password(request.current_password, current_user.password_hash):
+            raise HTTPException(401, "현재 비밀번호가 올바르지 않습니다.")
+    if wants_email_change:
+        if await db.scalar(select(User).where(User.email == request.email, User.id != current_user.id)):
+            raise HTTPException(409, "이미 사용 중인 이메일입니다.")
+    # current_user was loaded on get_current_user's own session; reload it on this endpoint's
+    # session so the mutations below are the ones db.commit() actually persists.
+    user = await db.get(User, current_user.id)
+    if wants_email_change:
+        user.email = request.email
+    if request.name is not None:
+        user.name = request.name
+    if wants_password_change:
+        user.password_hash = hash_password(request.new_password)
+    await db.commit()
+    await db.refresh(user)
+    return user
 
 @app.get("/subjects", response_model=list[SubjectResponse], tags=["curriculum"])
 async def list_subjects(db: AsyncSession = Depends(db_session)):

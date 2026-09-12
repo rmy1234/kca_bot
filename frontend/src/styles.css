@@ -1,5 +1,6 @@
-:root { font-family: Inter, Pretendard, system-ui, sans-serif; color: #172033; background: #f5f7fb; font-synthesis: none; }
+:root { font-family: Inter, Pretendard, system-ui, sans-serif; color: #172033; background: #f5f7fb; font-synthesis: none; color-scheme: light; }
 * { box-sizing: border-box; }
+input, select, textarea { color: #172033; }
 body { margin: 0; }
 .page-shell { max-width: 1080px; margin: 0 auto; padding: 56px 24px; }
 .hero { margin-bottom: 30px; }
@@ -60,6 +61,10 @@ textarea { border: 1px solid #d9dfeb; border-radius: 10px; display: block; font:
 .app-layout { display: flex; min-height: 100vh; background: #f7f8fc; }
 .sidebar { background: #fff; border-right: 1px solid #e9ebf2; display: flex; flex-direction: column; padding: 24px 14px; width: 248px; }
 .brand { align-items: center; display: flex; font-size: 1.12rem; font-weight: 800; gap: 10px; padding: 0 10px 30px; }
+.brand-button { background: transparent; border: 0; border-radius: 10px; color: inherit; cursor: pointer; font: inherit; text-align: left; transition: opacity .15s ease; }
+.brand-button:hover { opacity: .75; }
+.brand-button:active { transform: scale(.98); }
+.brand-button:focus-visible { outline: 2px solid #5968f2; outline-offset: 2px; }
 .brand-mark { align-items: center; background: #5968f2; border-radius: 9px; color: #fff; display: flex; height: 30px; justify-content: center; width: 30px; }
 .sidebar-label { color: #98a0b2; font-size: .72rem; font-weight: 800; letter-spacing: .08em; margin: 0 10px 9px; }
 .sidebar-nav { display: grid; gap: 5px; }
@@ -77,6 +82,13 @@ textarea { border: 1px solid #d9dfeb; border-radius: 10px; display: block; font:
 .view-panel { animation: view-in .24s ease both; }
 .tabs button, .segmented button { transition: background-color .18s ease, color .18s ease, box-shadow .18s ease; }
 .model-banner { align-items: flex-start; background: #fff6e5; border: 1px solid #ffe0a8; border-radius: 12px; color: #8a5300; display: flex; font-size: .88rem; gap: 10px; line-height: 1.55; margin-bottom: 20px; padding: 12px 16px; }
+.profile-card { max-width: 480px; }
+.profile-form { display: grid; gap: 16px; margin-top: 16px; }
+.profile-form input { background: #fff; border: 1px solid #e2e5ef; border-radius: 9px; font-size: .92rem; padding: 11px 13px; width: 100%; }
+.profile-form input:focus { border-color: #5968f2; outline: none; }
+.profile-form .primary-action { justify-self: start; }
+.profile-password-change { border-top: 1px solid #eef0f5; display: grid; gap: 16px; padding-top: 16px; }
+.profile-message { color: #166534; font-size: .85rem; margin: 0; }
 @keyframes nav-pop { 40% { transform: scale(1.25); } }
 @keyframes view-in { from { opacity: 0; transform: translateY(8px); } }
 @media (prefers-reduced-motion: reduce) { .side-item, .side-item::before, .tabs button, .segmented button { transition: none; } .side-item.active > span, .view-panel { animation: none; } }
@@ -86,6 +98,12 @@ textarea { border: 1px solid #d9dfeb; border-radius: 10px; display: block; font:
 .sidebar-bottom small { color: #98a0b2; font-size: .72rem; margin-top: 3px; }
 .avatar { align-items: center; background: #e6e9ff; border-radius: 50%; color: #536dfe; display: flex; font-weight: 800; height: 34px; justify-content: center; width: 34px; }
 .sidebar-bottom .text-button { margin-left: auto; white-space: nowrap; }
+.sidebar-profile { align-items: center; background: transparent; border: 0; border-radius: 10px; color: inherit; cursor: pointer; display: flex; gap: 10px; margin: -6px; min-width: 0; overflow: hidden; padding: 6px; text-align: left; transition: background-color .15s ease; }
+.sidebar-profile:hover { background: #f4f5fb; }
+.sidebar-profile[aria-current="page"] { background: #eef0ff; }
+.sidebar-profile:focus-visible { outline: 2px solid #5968f2; outline-offset: 2px; }
+.sidebar-profile div { min-width: 0; }
+.sidebar-profile strong, .sidebar-profile small { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .auth-layout { align-items: center; background: #f7f8fc; display: flex; justify-content: center; min-height: 100vh; padding: 24px; }
 .auth-card { display: grid; gap: 14px; max-width: 380px; width: 100%; }
 .auth-card h2 { font-size: 1.5rem; letter-spacing: -.04em; margin: 0; }

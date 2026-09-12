@@ -218,3 +218,10 @@ class UserResponse(BaseModel):
     email: str | None
     is_admin: bool
     target_exam_date: date | None
+
+class UpdateProfileRequest(BaseModel):
+    name: str | None = Field(None, min_length=1, max_length=120)
+    email: EmailStr | None = None
+    new_password: str | None = Field(None, min_length=8, max_length=200)
+    # Required to confirm an email or password change; not needed for a name-only update.
+    current_password: str | None = None
