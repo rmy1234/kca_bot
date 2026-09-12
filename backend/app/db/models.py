@@ -104,12 +104,13 @@ class SourceDocument(Base):
     id: Mapped[int] = mapped_column(primary_key=True)
     title: Mapped[str] = mapped_column(String(300), nullable=False)
     doc_type: Mapped[str] = mapped_column(String(30), nullable=False)
-    subject_id: Mapped[int] = mapped_column(ForeignKey("subjects.id"), nullable=False, index=True)
+    # None means the document covers every subject, so its chunks are classified against all Topics.
+    subject_id: Mapped[int | None] = mapped_column(ForeignKey("subjects.id"), nullable=True, index=True)
     uploaded_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
     version: Mapped[str] = mapped_column(String(80), default="v1")
     status: Mapped[str] = mapped_column(String(30), default="처리중", nullable=False)
     error_message: Mapped[str | None] = mapped_column(Text, nullable=True)
-    subject: Mapped[Subject] = relationship(back_populates="source_documents")
+    subject: Mapped[Subject | None] = relationship(back_populates="source_documents")
     embeddings: Mapped[list[TopicEmbedding]] = relationship(back_populates="source_document", cascade="all, delete-orphan")
     reference_questions: Mapped[list["ReferenceQuestion"]] = relationship(back_populates="source_document", cascade="all, delete-orphan")
 

@@ -1,5 +1,6 @@
 import hashlib
 import math
+import random
 
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -8,8 +9,13 @@ from app.db.models import Question, ReferenceQuestion, Topic, TopicEmbedding
 
 
 EMBEDDING_DIMENSION = 64
-TOP_K = 3
 DUPLICATE_THRESHOLD = 0.92
+# Study-material characters for one generation request, split across its Topics so a subject-wide
+# prompt plus the generated JSON still fits a local model's context window (OLLAMA_NUM_CTX).
+CONTEXT_CHAR_BUDGET = 4000
+MIN_TOPIC_CONTEXT_CHARS = 400
+CONTEXT_CANDIDATES = 6
+MIN_CONTEXT_PIECE_CHARS = 200
 
 
 def embed_text(text: str) -> list[float]:
@@ -52,15 +58,32 @@ async def ensure_topic_embeddings(session: AsyncSession, topic: Topic) -> list[T
     return embeddings
 
 
-async def retrieve_context(session: AsyncSession, topic: Topic, top_k: int = TOP_K) -> list[tuple[str, float]]:
-    embeddings = await ensure_topic_embeddings(session, topic)
+def pack_context(chunks: list[str], char_budget: int) -> list[str]:
+    """Take chunks in order until the character budget is spent, truncating the chunk that crosses it."""
+    packed: list[str] = []
+    remaining = char_budget
+    for chunk in chunks:
+        if remaining < MIN_CONTEXT_PIECE_CHARS:
+            break
+        packed.append(chunk[:remaining])
+        remaining -= len(chunk)
+    return packed
+
+
+async def retrieve_context(session: AsyncSession, topic: Topic, char_budget: int = CONTEXT_CHAR_BUDGET) -> list[str]:
+    """Uploaded study-material excerpts classified under this Topic; the Topic summary is already in the prompt."""
+    chunks = (await session.scalars(
+        select(TopicEmbedding).where(
+            TopicEmbedding.topic_id == topic.id,
+            TopicEmbedding.source_document_id.is_not(None),
+        )
+    )).all()
     query_vector = embed_text(f"{topic.name} {' '.join(topic.keywords)} {topic.summary_text}")
-    ranked = sorted(
-        ((item.chunk_text, cosine_similarity(query_vector, item.embedding)) for item in embeddings),
-        key=lambda item: item[1],
-        reverse=True,
-    )
-    return ranked[:top_k]
+    ranked = sorted(chunks, key=lambda item: cosine_similarity(query_vector, item.embedding), reverse=True)
+    # Shuffle the most relevant excerpts so repeated generations draw on different parts of the material.
+    candidates = [item.chunk_text for item in ranked[:CONTEXT_CANDIDATES]]
+    random.shuffle(candidates)
+    return pack_context(candidates, char_budget)
 
 
 async def is_duplicate_question(session: AsyncSession, topic_id: int, question_text: str) -> tuple[bool, float]:

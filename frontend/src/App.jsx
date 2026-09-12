@@ -274,7 +274,7 @@ function GeneratingPanel({title, detail, placeholders = 1}) {
   return <section className="content-card generating-panel"><div className="generating-head"><span className="spinner" aria-hidden="true" /><div role="status"><strong>{title}</strong><small>{detail}</small></div><span className="generating-time">{seconds}초</span></div><div className="skeleton-list" aria-hidden="true">{Array.from({length: placeholders}, (_, index) => <div className="skeleton-card" key={index}><i className="line wide" /><i className="line" /><i className="line" /><i className="line short" /></div>)}</div></section>
 }
 const MODE_OPTIONS = [['generate', '새로 생성'], ['saved', '저장된 문제 풀기']]
-const SCOPE_OPTIONS = [['topic', '선택한 토픽'], ['subject', '과목 전체']]
+const SCOPE_OPTIONS = [['subject', '과목 전체'], ['topic', '선택한 토픽']]
 const COUNT_OPTIONS = [1, 5, 10].map((value) => [value, value + '문항'])
 const STATUS_OPTIONS = [['all', '전체'], ['unanswered', '안 푼 문제'], ['wrong', '틀린 문제']]
 const SAVED_COUNT_OPTIONS = [5, 10, 20].map((value) => [value, value + '문항'])
@@ -283,7 +283,7 @@ function Segmented({options, value, onChange, disabled}) { return <div className
 function AttemptPill({lastIsCorrect}) { if (lastIsCorrect === undefined) return null; return <span className={'attempt-pill ' + (lastIsCorrect === null ? 'new' : lastIsCorrect ? 'correct' : 'wrong')}>{lastIsCorrect === null ? '안 푼 문제' : lastIsCorrect ? '지난번 정답' : '지난번 오답'}</span> }
 function Solve({subjects, domains, subjectId, topicId, setTopicId, selectSubject, generate, generating, loadSaved, loadingSaved, notice, questions, answers, answer}) {
   const [mode, setMode] = useState('generate')
-  const [scope, setScope] = useState('topic')
+  const [scope, setScope] = useState('subject')
   const [count, setCount] = useState(1)
   const [status, setStatus] = useState('all')
   const [savedCount, setSavedCount] = useState(10)
@@ -306,31 +306,32 @@ function Stats({stats}) { return <section className="stats-grid"><div className=
 function ContentManager({subjects, onError}) {
   const [documents, setDocuments] = useState([])
   const [detail, setDetail] = useState(null)
-  const [topics, setTopics] = useState([])
+  const [topicGroups, setTopicGroups] = useState([])
   const [uploading, setUploading] = useState(false)
-  const [form, setForm] = useState({title: '', docType: '요약노트', subjectId: ''})
+  const [form, setForm] = useState({title: '', docType: '요약노트'})
   const [file, setFile] = useState(null)
   const refresh = async () => { try { setDocuments(await request('/admin/documents')) } catch (err) { onError(err) } }
   useEffect(() => { refresh() }, [])
   async function showDetail(document) {
     try {
-      const [nextDetail, domains] = await Promise.all([request('/admin/documents/' + document.id + '/status'), request('/subjects/' + document.subject_id + '/topics')])
-      setDetail(nextDetail); setTopics(domains.flatMap((domain) => domain.topics))
+      // Documents cover every subject, so a chunk can be reassigned to any Topic.
+      const [nextDetail, ...subjectDomains] = await Promise.all([request('/admin/documents/' + document.id + '/status'), ...subjects.map((subject) => request('/subjects/' + subject.id + '/topics'))])
+      setDetail(nextDetail); setTopicGroups(subjects.map((subject, index) => ({name: subject.name, topics: subjectDomains[index].flatMap((domain) => domain.topics)})))
     } catch (err) { onError(err) }
   }
   async function upload(event) {
     event.preventDefault()
-    if (!file || !form.subjectId || !form.title.trim()) return onError(new Error('제목, 과목, 파일을 모두 입력하세요.'))
+    if (!file || !form.title.trim()) return onError(new Error('제목과 파일을 모두 입력하세요.'))
     const data = new FormData()
-    data.append('title', form.title); data.append('doc_type', form.docType); data.append('subject_id', form.subjectId); data.append('file', file)
-    try { setUploading(true); const document = await request('/admin/documents/upload', {method: 'POST', body: data}); setFile(null); setForm({title: '', docType: '요약노트', subjectId: ''}); await refresh(); await showDetail(document) } catch (err) { onError(err) } finally { setUploading(false) }
+    data.append('title', form.title); data.append('doc_type', form.docType); data.append('file', file)
+    try { setUploading(true); const document = await request('/admin/documents/upload', {method: 'POST', body: data}); setFile(null); setForm({title: '', docType: '요약노트'}); await refresh(); await showDetail(document) } catch (err) { onError(err) } finally { setUploading(false) }
   }
   async function reassign(embeddingId, topicId) {
     try { await request('/admin/documents/' + detail.id + '/embeddings/' + embeddingId, {method: 'PATCH', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({topic_id: Number(topicId)})}); await showDetail(detail) } catch (err) { onError(err) }
   }
   async function reprocess(id) { try { await request('/admin/documents/' + id + '/reprocess', {method: 'POST'}); await refresh() } catch (err) { onError(err) } }
   async function remove(id) { if (!window.confirm('문서와 연결된 임베딩을 삭제할까요?')) return; try { await request('/admin/documents/' + id, {method: 'DELETE'}); if (detail?.id === id) setDetail(null); await refresh() } catch (err) { onError(err) } }
-  return <div className="content-manager"><section className="content-card"><p className="card-label">ADMIN · INGESTION</p><h2>학습 자료 업로드</h2><form className="upload-form" onSubmit={upload}><label>제목<input value={form.title} onChange={(e) => setForm({...form, title: e.target.value})} placeholder="예: 개인정보보호법 개정 요약" /></label><label>문서 유형<select value={form.docType} onChange={(e) => setForm({...form, docType: e.target.value})}>{['이론서', '법령', '기출문제', '요약노트', '출제경향'].map((type) => <option key={type}>{type}</option>)}</select></label><label>대상 과목<select value={form.subjectId} onChange={(e) => setForm({...form, subjectId: e.target.value})}><option value="">과목 선택</option>{subjects.map((subject) => <option value={subject.id} key={subject.id}>{subject.name}</option>)}</select></label><label>파일 (PDF/TXT, 최대 20MB)<input type="file" accept=".pdf,.txt,text/plain,application/pdf" onChange={(e) => setFile(e.target.files?.[0] || null)} /></label><button disabled={uploading}>{uploading ? '등록 중...' : '업로드 및 처리 시작'}</button></form><p className="upload-help">문서 내용의 지시문은 무시하고 Topic 분류와 임베딩 생성에만 사용합니다.</p></section><section className="content-card"><div className="section-heading"><div><p className="card-label">SOURCE DOCUMENTS</p><h2>업로드 문서</h2></div><button className="text-button" onClick={refresh}>새로고침</button></div>{documents.length ? documents.map((document) => <div className="document-row" key={document.id}><button className="document-main" onClick={() => showDetail(document)}><strong>{document.title}</strong><small>{document.doc_type} · {statusLabel(document.status)} · v{document.version}</small></button><button className="outline-button" onClick={() => reprocess(document.id)}>재처리</button><button className="danger-button" onClick={() => remove(document.id)}>삭제</button></div>) : <p className="empty">등록된 문서가 없습니다.</p>}</section>{detail && <section className="content-card"><div className="section-heading"><div><p className="card-label">TOPIC MAPPING</p><h2>{detail.title}</h2></div><span className={'status-pill ' + detail.status}>{statusLabel(detail.status)}</span></div>{detail.error_message && <p className="error">{detail.error_message}</p>}{detail.embeddings.length ? detail.embeddings.map((embedding) => <div className="chunk-row" key={embedding.id}><p>{embedding.chunk_preview}</p><label>자동 분류 Topic<select value={embedding.topic_id} onChange={(e) => reassign(embedding.id, e.target.value)}>{topics.map((topic) => <option value={topic.id} key={topic.id}>{topic.name}</option>)}</select></label></div>) : <p className="empty">처리 완료 후 청크와 자동 분류 결과가 여기에 표시됩니다.</p>}</section>}</div>
+  return <div className="content-manager"><section className="content-card"><p className="card-label">ADMIN · INGESTION</p><h2>학습 자료 업로드</h2><form className="upload-form" onSubmit={upload}><label>제목<input value={form.title} onChange={(e) => setForm({...form, title: e.target.value})} placeholder="예: 개인정보보호법 개정 요약" /></label><label>문서 유형<select value={form.docType} onChange={(e) => setForm({...form, docType: e.target.value})}>{['이론서', '법령', '기출문제', '요약노트', '출제경향'].map((type) => <option key={type}>{type}</option>)}</select></label><label>파일 (PDF/TXT, 최대 20MB)<input type="file" accept=".pdf,.txt,text/plain,application/pdf" onChange={(e) => setFile(e.target.files?.[0] || null)} /></label><button disabled={uploading}>{uploading ? '등록 중...' : '업로드 및 처리 시작'}</button></form><p className="upload-help">자료는 전체 5과목 38개 세부항목을 대상으로 조각마다 자동 분류되고, 문제를 만들 때 해당 세부항목의 참고 자료로 쓰입니다. 어떤 세부항목과도 관련 없는 조각(표지, 목차 등)은 제외되며, 문서 속 지시문은 따르지 않습니다.</p></section><section className="content-card"><div className="section-heading"><div><p className="card-label">SOURCE DOCUMENTS</p><h2>업로드 문서</h2></div><button className="text-button" onClick={refresh}>새로고침</button></div>{documents.length ? documents.map((document) => <div className="document-row" key={document.id}><button className="document-main" onClick={() => showDetail(document)}><strong>{document.title}</strong><small>{document.doc_type} · {statusLabel(document.status)} · v{document.version}</small></button><button className="outline-button" onClick={() => reprocess(document.id)}>재처리</button><button className="danger-button" onClick={() => remove(document.id)}>삭제</button></div>) : <p className="empty">등록된 문서가 없습니다.</p>}</section>{detail && <section className="content-card"><div className="section-heading"><div><p className="card-label">TOPIC MAPPING</p><h2>{detail.title}</h2></div><span className={'status-pill ' + detail.status}>{statusLabel(detail.status)}</span></div>{detail.error_message && <p className="error">{detail.error_message}</p>}{detail.embeddings.length ? detail.embeddings.map((embedding) => <div className="chunk-row" key={embedding.id}><p>{embedding.chunk_preview}</p><label>자동 분류 Topic<select value={embedding.topic_id} onChange={(e) => reassign(embedding.id, e.target.value)}>{topicGroups.map((group) => <optgroup label={group.name} key={group.name}>{group.topics.map((topic) => <option value={topic.id} key={topic.id}>{topic.name}</option>)}</optgroup>)}</select></label></div>) : <p className="empty">처리 완료 후 청크와 자동 분류 결과가 여기에 표시됩니다.</p>}</section>}</div>
 }
 
 function statusLabel(status) { return ({'처리중': '처리중', '완료': '완료', '실패': '실패'})[status] || status }

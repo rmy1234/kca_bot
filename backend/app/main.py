@@ -17,7 +17,7 @@ from app.db.base import Base
 from app.db.models import Domain, GenerationLog, Question, ReferenceQuestion, ReviewSchedule, SourceDocument, Subject, Topic, TopicEmbedding, User, UserAnswerLog, UserEssayAnswer
 from app.db.session import AsyncSessionLocal, engine
 from app.llm import LLMUnavailableError, QuestionRequest, get_question_generator, llm_backend, llm_status, model_label, verify_questions
-from app.rag import is_duplicate_question, retrieve_context, retrieve_reference_questions
+from app.rag import CONTEXT_CHAR_BUDGET, MIN_TOPIC_CONTEXT_CHARS, is_duplicate_question, retrieve_context, retrieve_reference_questions
 from app.schemas import (
     AccuracyStat, AnswerRequest, AnswerResponse, DomainTopicsResponse,
     GenerateQuestionsRequest, GenerateQuestionsResponse, LLMStatusResponse, PoolQuestionResponse, QuestionResponse, StatsResponse,
@@ -141,11 +141,13 @@ async def generate_questions(request: GenerateQuestionsRequest, db: AsyncSession
         if not topic:
             raise HTTPException(404, "Topic not found")
         plan = [(topic, request.count)]
+    # Split the study-material budget across topics so a subject-wide prompt still fits the model's context window.
+    char_budget = max(MIN_TOPIC_CONTEXT_CHARS, CONTEXT_CHAR_BUDGET // len(plan))
     requests = []
     for topic, count in plan:
-        context = await retrieve_context(db, topic)
+        context = await retrieve_context(db, topic, char_budget)
         references = await retrieve_reference_questions(db, topic.id)
-        requests.append(QuestionRequest(topic=topic, count=count, context=[item[0] for item in context], references=references))
+        requests.append(QuestionRequest(topic=topic, count=count, context=context, references=references))
     # One generation call and one verification call per request, whatever the count, to fit the free-tier rate limit.
     try:
         generated = await get_question_generator().generate(requests)
@@ -231,7 +233,6 @@ async def upload_document(
     background_tasks: BackgroundTasks,
     title: str = Form(...),
     doc_type: str = Form(...),
-    subject_id: int = Form(...),
     version: str = Form("v1"),
     file: UploadFile = File(...),
     db: AsyncSession = Depends(db_session),
@@ -239,14 +240,13 @@ async def upload_document(
 ):
     if doc_type not in ALLOWED_DOC_TYPES:
         raise HTTPException(422, "doc_type must be one of: " + ", ".join(ALLOWED_DOC_TYPES))
-    if not await db.get(Subject, subject_id):
-        raise HTTPException(404, "Subject not found")
     payload = await file.read(MAX_UPLOAD_BYTES + 1)
     try:
         suffix = validate_upload(file.filename or "", file.content_type, payload)
     except ValueError as exc:
         raise HTTPException(422, str(exc)) from exc
-    document = SourceDocument(title=title.strip(), doc_type=doc_type, subject_id=subject_id, version=version.strip() or "v1", status="처리중")
+    # Uploaded material covers every subject; each chunk is classified against all Topics.
+    document = SourceDocument(title=title.strip(), doc_type=doc_type, subject_id=None, version=version.strip() or "v1", status="처리중")
     if not document.title:
         raise HTTPException(422, "title is required")
     db.add(document)
@@ -286,7 +286,8 @@ async def reassign_document_embedding(document_id: int, embedding_id: int, reque
         raise HTTPException(404, "Topic not found")
     document = await db.get(SourceDocument, document_id)
     topic_domain = await db.get(Domain, topic.domain_id)
-    if topic_domain.subject_id != document.subject_id:
+    # A document without a subject covers every subject, so any Topic is allowed.
+    if document.subject_id is not None and topic_domain.subject_id != document.subject_id:
         raise HTTPException(422, "Topic must belong to the document subject")
     embedding.topic_id = topic.id
     await db.commit()
@@ -333,7 +334,7 @@ async def create_reference_question(request: ReferenceQuestionRequest, db: Async
     if not document or not topic:
         raise HTTPException(404, "Source document or Topic not found")
     topic_domain = await db.get(Domain, topic.domain_id)
-    if topic_domain.subject_id != document.subject_id:
+    if document.subject_id is not None and topic_domain.subject_id != document.subject_id:
         raise HTTPException(422, "Topic must belong to the source document subject")
     reference = ReferenceQuestion(**request.model_dump())
     db.add(reference)
@@ -416,7 +417,7 @@ async def regenerate_similar(question_id: int, db: AsyncSession = Depends(db_ses
     if not question:
         raise HTTPException(404, "Question not found")
     try:
-        generated = await get_question_generator().generate([QuestionRequest(topic=question.topic, count=1)])
+        generated = await get_question_generator().generate([QuestionRequest(topic=question.topic, count=1, context=await retrieve_context(db, question.topic))])
         generation_model = model_label()
     except LLMUnavailableError as exc:
         raise llm_unavailable(exc) from exc

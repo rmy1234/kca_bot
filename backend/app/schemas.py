@@ -155,7 +155,7 @@ class SourceDocumentResponse(BaseModel):
     id: int
     title: str
     doc_type: str
-    subject_id: int
+    subject_id: int | None
     uploaded_at: datetime
     version: str
     status: str

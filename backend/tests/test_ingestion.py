@@ -97,6 +97,18 @@ def test_classify_chunk_picks_topic_with_most_keyword_matches():
     assert result.name == "암호학"
 
 
+def test_classify_chunk_prefers_more_specific_name_on_tie():
+    general = _topic("정보보호 관련 법제", [], "")
+    specific = _topic("개인정보보호 관련 법제", [], "")
+    result = classify_chunk("개인정보보호 관련 법제에서 정보주체의 권리를 규정한다.", [general, specific])
+    assert result is specific
+
+
+def test_classify_chunk_returns_none_when_no_topic_matches():
+    topic = _topic("암호학", ["대칭키 암호"], "대칭키 암호를 정리한다.")
+    assert classify_chunk("목차 1장 2장 3장", [topic]) is None
+
+
 def test_classify_chunk_raises_without_topics():
     with pytest.raises(ValueError):
         classify_chunk("아무 내용", [])
