@@ -1,5 +1,5 @@
-from datetime import datetime
-from pydantic import BaseModel, ConfigDict, Field
+from datetime import date, datetime
+from pydantic import BaseModel, ConfigDict, EmailStr, Field, model_validator
 
 class SubjectResponse(BaseModel):
     model_config = ConfigDict(from_attributes=True)
@@ -21,8 +21,15 @@ class DomainTopicsResponse(BaseModel):
     topics: list[TopicResponse]
 
 class GenerateQuestionsRequest(BaseModel):
-    topic_id: int
+    topic_id: int | None = None
+    subject_id: int | None = None
     count: int = Field(1, ge=1, le=10)
+
+    @model_validator(mode="after")
+    def check_scope(self):
+        if (self.topic_id is None) == (self.subject_id is None):
+            raise ValueError("topic_id와 subject_id 중 하나만 지정하세요.")
+        return self
 
 class QuestionResponse(BaseModel):
     model_config = ConfigDict(from_attributes=True)
@@ -38,10 +45,28 @@ class QuestionResponse(BaseModel):
     quality_score: float
     generated_at: datetime
     model_version: str
+    verification_status: str
+
+class PoolQuestionResponse(QuestionResponse):
+    last_is_correct: bool | None = None
+
+class LLMStatusResponse(BaseModel):
+    provider: str
+    active_model: str
+    primary_model: str | None
+    fallback_model: str | None
+    fallback_active: bool
+    fallback_until: datetime | None
+    fallback_reason: str | None
+
+class GenerateQuestionsResponse(BaseModel):
+    questions: list[QuestionResponse]
+    requested: int
+    rejected: int
+    unverified: int
 
 class AnswerRequest(BaseModel):
     selected_index: int = Field(ge=0, le=3)
-    user_id: int = Field(default=1, ge=1)
     time_spent: int | None = Field(default=None, ge=0)
 
 class AnswerResponse(BaseModel):
@@ -93,7 +118,6 @@ class EssayQuestionResponse(BaseModel):
     created_at: datetime
 
 class EssaySubmitRequest(BaseModel):
-    user_id: int = Field(default=1, ge=1)
     answer_text: str = Field(min_length=1, max_length=10000)
 
 class EssayFeedbackResponse(BaseModel):
@@ -169,3 +193,28 @@ class ReferenceQuestionResponse(BaseModel):
     original_text: str
     year: int | None
     note: str | None
+
+
+class RegisterRequest(BaseModel):
+    email: EmailStr
+    password: str = Field(min_length=8, max_length=200)
+    name: str = Field(min_length=1, max_length=120)
+
+
+class LoginRequest(BaseModel):
+    email: EmailStr
+    password: str
+
+
+class TokenResponse(BaseModel):
+    access_token: str
+    token_type: str = "bearer"
+
+
+class UserResponse(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+    id: int
+    name: str
+    email: str | None
+    is_admin: bool
+    target_exam_date: date | None

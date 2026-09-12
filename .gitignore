@@ -16,12 +16,21 @@ node_modules/
 frontend/dist/
 frontend/.vite/
 
+# Exam criteria without a confirmed redistribution license (see docs/sources/README.md); keep local copies only
+docs/sources/exam_criteria/*2027-2029*
+
 # IDE / OS
 .vscode/
 .idea/
 .DS_Store
 Thumbs.db
 
-# Local data
+# Local data (the SQLite DB holds accounts, answer logs, and uploaded study material)
 *.log
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
+*.sqlite
 *.sqlite3
+*.bak

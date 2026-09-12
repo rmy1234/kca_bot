@@ -51,6 +51,8 @@ class Question(Base):
     source: Mapped[str | None] = mapped_column(String(500))
     difficulty: Mapped[int] = mapped_column(Integer, default=1)
     quality_score: Mapped[float] = mapped_column(Float, default=1.0)
+    # "verified" or "unverified" (the verification call failed, e.g. rate limit, so the question was kept unchecked).
+    verification_status: Mapped[str] = mapped_column(String(20), default="verified", server_default="verified")
     generated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
     model_version: Mapped[str] = mapped_column(String(80), default="mock-v1")
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
@@ -75,6 +77,9 @@ class User(Base):
 
     id: Mapped[int] = mapped_column(primary_key=True)
     name: Mapped[str] = mapped_column(String(120), nullable=False)
+    email: Mapped[str | None] = mapped_column(String(255), unique=True, index=True, nullable=True)
+    password_hash: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    is_admin: Mapped[bool] = mapped_column(default=False, server_default="0")
     target_exam_date: Mapped[date | None] = mapped_column(Date, nullable=True)
     answer_logs: Mapped[list[UserAnswerLog]] = relationship(back_populates="user")
     essay_answers: Mapped[list["UserEssayAnswer"]] = relationship(back_populates="user")

@@ -1,6 +1,9 @@
 from dataclasses import dataclass
 
+from pydantic import BaseModel, Field
+
 from app.db.models import Question, Topic
+from app.llm import generate_structured, llm_backend
 from app.prompts.essay_grading import build_essay_generation_prompt, build_essay_grading_prompt
 
 DISCLAIMER = "이 채점은 참고용이며 실제 실기 시험 채점 기준과 다를 수 있음"
@@ -58,6 +61,49 @@ class MockEssayLLM:
         return EssayFeedback(covered, missing, score, feedback, suggestion)
 
 
-def get_essay_llm() -> MockEssayLLM:
-    return MockEssayLLM()
+class _GradingKeywordItem(BaseModel):
+    keyword: str
+    points: int
+
+
+class _EssayGenerationSchema(BaseModel):
+    question: str
+    model_answer: str
+    grading_keywords: list[_GradingKeywordItem]
+    difficulty: int = Field(ge=1, le=3)
+
+
+class _EssayGradingSchema(BaseModel):
+    covered_keywords: list[_GradingKeywordItem]
+    missing_keywords: list[_GradingKeywordItem]
+    score: float
+    feedback_text: str
+    improvement_suggestion: str
+
+
+class StructuredEssayLLM:
+    """Generates practical essay questions and grades answers with the configured LLM (Gemini or Ollama)."""
+
+    async def generate(self, topic: Topic) -> GeneratedEssay:
+        parsed = await generate_structured(_EssayGenerationSchema, build_essay_generation_prompt(topic), max_output_tokens=8192)
+        return GeneratedEssay(
+            question=parsed.question,
+            model_answer=parsed.model_answer,
+            grading_keywords=[item.model_dump() for item in parsed.grading_keywords],
+            difficulty=parsed.difficulty,
+        )
+
+    async def grade(self, question: Question, answer_text: str) -> EssayFeedback:
+        parsed = await generate_structured(_EssayGradingSchema, build_essay_grading_prompt(question, answer_text), max_output_tokens=8192)
+        return EssayFeedback(
+            covered_keywords=[item.model_dump() for item in parsed.covered_keywords],
+            missing_keywords=[item.model_dump() for item in parsed.missing_keywords],
+            score=parsed.score,
+            feedback_text=parsed.feedback_text,
+            improvement_suggestion=parsed.improvement_suggestion,
+        )
+
+
+def get_essay_llm() -> MockEssayLLM | StructuredEssayLLM:
+    return MockEssayLLM() if llm_backend() == "mock" else StructuredEssayLLM()
 
