@@ -24,6 +24,8 @@ class GenerateQuestionsRequest(BaseModel):
     topic_id: int | None = None
     subject_id: int | None = None
     count: int = Field(1, ge=1, le=10)
+    # None uses the server's configured default model; otherwise one of GET /llm/models.
+    model_key: str | None = Field(default=None, max_length=120)
 
     @model_validator(mode="after")
     def check_scope(self):
@@ -49,6 +51,12 @@ class QuestionResponse(BaseModel):
 
 class PoolQuestionResponse(QuestionResponse):
     last_is_correct: bool | None = None
+
+class ModelOptionResponse(BaseModel):
+    key: str
+    provider: str
+    model: str
+    is_default: bool
 
 class LLMStatusResponse(BaseModel):
     provider: str

@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 
 const API = import.meta.env.VITE_API_BASE_URL || 'http://localhost:8000'
 const TOKEN_KEY = 'kca_access_token'
@@ -53,6 +53,8 @@ function App() {
   const [notice, setNotice] = useState('')
   const [loadingSaved, setLoadingSaved] = useState(false)
   const [llmStatus, setLlmStatus] = useState(null)
+  const [models, setModels] = useState([])
+  const [modelKey, setModelKey] = useState('')
 
   useEffect(() => {
     handleUnauthorized = () => { setCurrentUser(null); setAuthMode('login') }
@@ -64,6 +66,11 @@ function App() {
     request('/subjects').then(setSubjects).catch(showError)
     loadPersonalData()
     refreshLlmStatus()
+    // The picker starts on whichever model the server is configured to use.
+    request('/llm/models').then((list) => {
+      setModels(list)
+      setModelKey((current) => current || (list.find((item) => item.is_default) || list[0])?.key || '')
+    }).catch(() => {})
   }, [currentUser])
 
   async function restoreSession() {
@@ -82,6 +89,7 @@ function App() {
   function logout() {
     storeToken(null)
     setCurrentUser(null); setAuthMode('login'); setView('dashboard'); setError(''); setNotice(''); setLlmStatus(null)
+    setModels([]); setModelKey('')
     setSubjects([]); setDomains([]); setSubjectId(''); setTopicId(''); setQuestions([]); setAnswers({})
     setWrongNotes([]); setStats(null); setReviewQueue([])
     setEssayQuestion(null); setEssayText(''); setEssayFeedback(null)
@@ -112,6 +120,7 @@ function App() {
 
   async function generateQuestions(scope, count) {
     const payload = scope === 'subject' ? {subject_id: Number(subjectId), count} : {topic_id: Number(topicId), count}
+    if (modelKey) payload.model_key = modelKey
     setGenerating(true); setError(''); setNotice('')
     try {
       const result = await request('/questions/generate', {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(payload)})
@@ -200,7 +209,7 @@ function App() {
       <ModelBanner status={llmStatus} />
       <div className="view-panel" key={view}>
       {view === 'dashboard' && <Dashboard stats={stats} wrongNotes={wrongNotes} queue={reviewQueue} onNavigate={navigate} onTopic={startTopic} />}
-      {view === 'solve' && <Solve subjects={subjects} domains={domains} subjectId={subjectId} topicId={topicId} setTopicId={setTopicId} selectSubject={selectSubject} generate={generateQuestions} generating={generating} loadSaved={loadSavedQuestions} loadingSaved={loadingSaved} notice={notice} questions={questions} answers={answers} answer={answer} />}
+      {view === 'solve' && <Solve subjects={subjects} domains={domains} subjectId={subjectId} topicId={topicId} setTopicId={setTopicId} selectSubject={selectSubject} generate={generateQuestions} generating={generating} loadSaved={loadSavedQuestions} loadingSaved={loadingSaved} notice={notice} questions={questions} answers={answers} answer={answer} models={models} modelKey={modelKey} setModelKey={setModelKey} />}
       {view === 'essay' && <Essay subjects={subjects} domains={domains} subjectId={subjectId} topicId={topicId} generating={essayGenerating} setTopicId={setTopicId} selectSubject={selectSubject} generate={generateEssay} question={essayQuestion} text={essayText} setText={setEssayText} submit={submitEssay} feedback={essayFeedback} />}
       {view === 'wrong' && <WrongNotes notes={wrongNotes} retry={retryWrong} retrySame={retrySame} />}
       {view === 'stats' && <Stats stats={stats} />}
@@ -267,7 +276,7 @@ function Dashboard({stats, wrongNotes, queue, onNavigate, onTopic}) {
 
 function Metric({label, value, detail}) { return <div className="metric-card"><span>{label}</span><strong>{value}</strong><small>{detail}</small></div> }
 function ProgressRow({item}) { return <div className="progress-row"><div><span>{item.name}</span><strong>{item.accuracy}%</strong></div><div className="progress-track"><i style={{width: item.accuracy + '%'}} /></div><small>{item.correct}/{item.total} 정답</small></div> }
-function TopicSelector({subjects, domains, subjectId, topicId, setTopicId, selectSubject, topicDisabled = false, locked = false}) { return <section className="content-card selector"><label>과목<select value={subjectId} onChange={selectSubject} disabled={locked}><option value="" disabled>과목을 선택하세요</option>{subjects.map((s) => <option key={s.id} value={s.id}>{s.name}</option>)}</select></label><label>토픽<select value={topicDisabled ? '' : topicId} onChange={(e) => setTopicId(e.target.value)} disabled={locked || topicDisabled || !domains.length}><option value="">{topicDisabled ? '과목 전체에서 출제' : '토픽을 선택하세요'}</option>{domains.map((d) => <optgroup key={d.id} label={d.name}>{d.topics.map((t) => <option key={t.id} value={t.id}>{t.name}</option>)}</optgroup>)}</select></label></section> }
+function TopicSelector({subjects, domains, subjectId, topicId, setTopicId, selectSubject, topicDisabled = false, locked = false}) { return <section className="content-card selector"><label>과목<div className="select-shell"><select value={subjectId} onChange={selectSubject} disabled={locked}><option value="" disabled>과목을 선택하세요</option>{subjects.map((s) => <option key={s.id} value={s.id}>{s.name}</option>)}</select></div></label><label>토픽<div className="select-shell"><select value={topicDisabled ? '' : topicId} onChange={(e) => setTopicId(e.target.value)} disabled={locked || topicDisabled || !domains.length}><option value="">{topicDisabled ? '과목 전체에서 출제' : '토픽을 선택하세요'}</option>{domains.map((d) => <optgroup key={d.id} label={d.name}>{d.topics.map((t) => <option key={t.id} value={t.id}>{t.name}</option>)}</optgroup>)}</select></div></label></section> }
 function GeneratingPanel({title, detail, placeholders = 1}) {
   const [seconds, setSeconds] = useState(0)
   useEffect(() => { const timer = setInterval(() => setSeconds((value) => value + 1), 1000); return () => clearInterval(timer) }, [])
@@ -281,7 +290,43 @@ const SAVED_COUNT_OPTIONS = [5, 10, 20].map((value) => [value, value + '문항']
 function Segmented({options, value, onChange, disabled}) { return <div className="segmented">{options.map(([optionValue, label]) => <button type="button" key={optionValue} className={value === optionValue ? 'active' : ''} onClick={() => onChange(optionValue)} disabled={disabled}>{label}</button>)}</div> }
 // last_is_correct is only present on saved questions: null = never answered, true/false = latest attempt.
 function AttemptPill({lastIsCorrect}) { if (lastIsCorrect === undefined) return null; return <span className={'attempt-pill ' + (lastIsCorrect === null ? 'new' : lastIsCorrect ? 'correct' : 'wrong')}>{lastIsCorrect === null ? '안 푼 문제' : lastIsCorrect ? '지난번 정답' : '지난번 오답'}</span> }
-function Solve({subjects, domains, subjectId, topicId, setTopicId, selectSubject, generate, generating, loadSaved, loadingSaved, notice, questions, answers, answer}) {
+function modelOptionLabel(item) { return item.provider === 'gemini' ? 'Gemini ' + item.model.replace(/^gemini-/, '') : item.model }
+
+function ModelPicker({models, value, onChange, disabled}) {
+  const [open, setOpen] = useState(false)
+  const container = useRef(null)
+  const current = models.find((item) => item.key === value) || models[0]
+
+  useEffect(() => {
+    if (!open) return
+    function closeOnOutside(event) { if (!container.current?.contains(event.target)) setOpen(false) }
+    function closeOnEscape(event) { if (event.key === 'Escape') setOpen(false) }
+    document.addEventListener('mousedown', closeOnOutside)
+    document.addEventListener('keydown', closeOnEscape)
+    return () => { document.removeEventListener('mousedown', closeOnOutside); document.removeEventListener('keydown', closeOnEscape) }
+  }, [open])
+
+  if (!current) return null
+  return <div className="model-picker" ref={container}>
+    <button type="button" className={'model-trigger' + (open ? ' open' : '')} onClick={() => setOpen((previous) => !previous)} disabled={disabled} aria-haspopup="listbox" aria-expanded={open}>
+      <span className={'model-dot ' + current.provider} aria-hidden="true" />
+      <span className="model-name">{modelOptionLabel(current)}</span>
+      <span className="model-caret" aria-hidden="true">▾</span>
+    </button>
+    {open && <ul className="model-menu" role="listbox">
+      {models.map((item) => <li key={item.key}>
+        <button type="button" role="option" aria-selected={item.key === value} className={'model-option' + (item.key === value ? ' active' : '')} onClick={() => { onChange(item.key); setOpen(false) }}>
+          <span className={'model-dot ' + item.provider} aria-hidden="true" />
+          <span className="model-name">{modelOptionLabel(item)}</span>
+          <small>{item.provider === 'gemini' ? '클라우드' : '로컬'}</small>
+          <span className="model-check" aria-hidden="true">{item.key === value ? '✓' : ''}</span>
+        </button>
+      </li>)}
+    </ul>}
+  </div>
+}
+
+function Solve({subjects, domains, subjectId, topicId, setTopicId, selectSubject, generate, generating, loadSaved, loadingSaved, notice, questions, answers, answer, models, modelKey, setModelKey}) {
   const [mode, setMode] = useState('generate')
   const [scope, setScope] = useState('subject')
   const [count, setCount] = useState(1)
@@ -297,7 +342,7 @@ function Solve({subjects, domains, subjectId, topicId, setTopicId, selectSubject
   const action = mode === 'generate'
     ? {run: () => generate(scope, count), label: '문제 생성', busyLabel: '문제 생성 중...'}
     : {run: () => loadSaved(scope, status, savedCount), label: '문제 불러오기', busyLabel: '불러오는 중...'}
-  return <><TopicSelector {...{subjects, domains, subjectId, topicId, setTopicId, selectSubject}} topicDisabled={scope === 'subject'} locked={busy} /><section className="content-card generate-options"><div className="option-group"><span>풀이 방식</span><Segmented options={MODE_OPTIONS} value={mode} onChange={setMode} disabled={busy} /></div><div className="option-group"><span>출제 범위</span><Segmented options={SCOPE_OPTIONS} value={scope} onChange={setScope} disabled={busy} /></div>{mode === 'generate' ? <div className="option-group"><span>문항 수</span><Segmented options={COUNT_OPTIONS} value={count} onChange={setCount} disabled={busy} /></div> : <><div className="option-group"><span>풀이 상태</span><Segmented options={STATUS_OPTIONS} value={status} onChange={setStatus} disabled={busy} /></div><div className="option-group"><span>문항 수</span><Segmented options={SAVED_COUNT_OPTIONS} value={savedCount} onChange={setSavedCount} disabled={busy} /></div></>}</section><button className="primary-action" onClick={action.run} disabled={!ready || busy}>{busy ? <><span className="spinner inline" aria-hidden="true" />{action.busyLabel}</> : action.label}</button>{generating ? <GeneratingPanel title={scopeName + ' · ' + count + '문항 생성 중'} detail={generatingDetail} placeholders={Math.min(count, 3)} /> : <>{notice && <p className="notice" role="status">{notice}</p>}{questions.length > 0 && <p className="solve-status">{answered.length}/{questions.length}문항 풀이 · 정답 {correct}문항</p>}<section className="questions">{questions.map((q, index) => <article className="content-card question" key={q.id}><div className="question-meta"><p className="card-label">객관식 {index + 1}번{(q.topic_name || topicNames[q.topic_id]) ? ' · ' + (q.topic_name || topicNames[q.topic_id]) : ''}</p><AttemptPill lastIsCorrect={q.last_is_correct} />{q.verification_status === 'unverified' && <span className="attempt-pill unverified" title="AI 검증 호출이 실패해 검증을 거치지 못한 문제입니다. 정답과 해설을 한 번 더 확인하세요.">검증 보류</span>}</div><h2>{q.question_text}</h2><div className="choices">{q.choices.map((choice, index) => <button className={answers[q.id] && index === answers[q.id].correct_index ? 'choice correct' : answers[q.id] && index === answers[q.id].selectedIndex ? 'choice wrong' : 'choice'} key={choice} onClick={() => answer(q.id, index)} disabled={Boolean(answers[q.id])}>{index + 1}. {choice}</button>)}</div>{answers[q.id] && <div className={'feedback ' + (answers[q.id].is_correct ? 'correct-text' : 'wrong-text')}>{answers[q.id].is_correct ? '정답입니다.' : '오답입니다.'}<br />{answers[q.id].explanation}{q.last_is_correct !== undefined && q.last_is_correct !== null && <small className="retry-hint">이미 풀었던 문제라 정답률에는 반영되지 않습니다.</small>}</div>}</article>)}</section></>}</> }
+  return <><section className="content-card generate-options"><div className="option-group"><span>출제 범위</span><Segmented options={SCOPE_OPTIONS} value={scope} onChange={setScope} disabled={busy} /></div></section><TopicSelector {...{subjects, domains, subjectId, topicId, setTopicId, selectSubject}} topicDisabled={scope === 'subject'} locked={busy} /><section className="content-card generate-options"><div className="option-group"><span>풀이 방식</span><Segmented options={MODE_OPTIONS} value={mode} onChange={setMode} disabled={busy} /></div>{mode === 'generate' ? <><div className="option-group"><span>문항 수</span><Segmented options={COUNT_OPTIONS} value={count} onChange={setCount} disabled={busy} /></div>{models.length > 1 && <div className="option-group"><span>생성 모델</span><ModelPicker models={models} value={modelKey} onChange={setModelKey} disabled={busy} /></div>}</> : <><div className="option-group"><span>풀이 상태</span><Segmented options={STATUS_OPTIONS} value={status} onChange={setStatus} disabled={busy} /></div><div className="option-group"><span>문항 수</span><Segmented options={SAVED_COUNT_OPTIONS} value={savedCount} onChange={setSavedCount} disabled={busy} /></div></>}</section><button className="primary-action" onClick={action.run} disabled={!ready || busy}>{busy ? <><span className="spinner inline" aria-hidden="true" />{action.busyLabel}</> : action.label}</button>{generating ? <GeneratingPanel title={scopeName + ' · ' + count + '문항 생성 중'} detail={generatingDetail} placeholders={Math.min(count, 3)} /> : <>{notice && <p className="notice" role="status">{notice}</p>}{questions.length > 0 && <p className="solve-status">{answered.length}/{questions.length}문항 풀이 · 정답 {correct}문항</p>}<section className="questions">{questions.map((q, index) => <article className="content-card question" key={q.id}><div className="question-meta"><p className="card-label">객관식 {index + 1}번{(q.topic_name || topicNames[q.topic_id]) ? ' · ' + (q.topic_name || topicNames[q.topic_id]) : ''}</p><AttemptPill lastIsCorrect={q.last_is_correct} />{q.verification_status === 'unverified' && <span className="attempt-pill unverified" title="AI 검증 호출이 실패해 검증을 거치지 못한 문제입니다. 정답과 해설을 한 번 더 확인하세요.">검증 보류</span>}</div><h2>{q.question_text}</h2><div className="choices">{q.choices.map((choice, index) => <button className={answers[q.id] && index === answers[q.id].correct_index ? 'choice correct' : answers[q.id] && index === answers[q.id].selectedIndex ? 'choice wrong' : 'choice'} key={choice} onClick={() => answer(q.id, index)} disabled={Boolean(answers[q.id])}>{index + 1}. {choice}</button>)}</div>{answers[q.id] && <div className={'feedback ' + (answers[q.id].is_correct ? 'correct-text' : 'wrong-text')}>{answers[q.id].is_correct ? '정답입니다.' : '오답입니다.'}<br />{answers[q.id].explanation}{q.last_is_correct !== undefined && q.last_is_correct !== null && <small className="retry-hint">이미 풀었던 문제라 정답률에는 반영되지 않습니다.</small>}</div>}</article>)}</section></>}</> }
 function Essay({subjects, domains, subjectId, topicId, setTopicId, selectSubject, generate, generating, question, text, setText, submit, feedback}) { return <><TopicSelector {...{subjects, domains, subjectId, topicId, setTopicId, selectSubject}} locked={generating} /><button className="primary-action" onClick={generate} disabled={!topicId || generating}>{generating ? <><span className="spinner inline" aria-hidden="true" />실기 문제 생성 중...</> : '실기 문제 생성'}</button>{generating ? <GeneratingPanel title="실기 문제 생성 중" detail="문제와 모범답안, 채점 키워드를 함께 만듭니다." /> : question && <article className="content-card essay-card"><p className="card-label">실기 서술형</p><h2>{question.question_text}</h2><textarea value={text} onChange={(e) => setText(e.target.value)} placeholder="답안을 입력하세요." rows="8" /><button className="primary-action" onClick={submit} disabled={!text.trim()}>답안 제출 및 채점</button>{feedback && <EssayFeedback feedback={feedback} />}</article>}</> }
 function EssayFeedback({feedback}) { return <div className="essay-feedback"><h2>점수: {feedback.score}점</h2><p>{feedback.feedback_text}</p><h3>포함된 키워드</h3><div className="keyword-list">{feedback.covered_keywords.map((item) => <span className="keyword covered" key={item.keyword}>{item.keyword} +{item.points}</span>)}</div><h3>누락된 키워드</h3><div className="keyword-list">{feedback.missing_keywords.map((item) => <span className="keyword missing" key={item.keyword}>{item.keyword} -{item.points}</span>)}</div><p><strong>개선 제안:</strong> {feedback.improvement_suggestion}</p><p className="disclaimer">{feedback.disclaimer}</p></div> }
 function WrongNotes({notes, retry, retrySame}) { return <section className="content-card"><div className="section-heading"><div><p className="card-label">MISTAKE REVIEW</p><h2>오답 노트</h2></div><span className="count-pill">{notes.length}문제</span></div>{notes.length ? notes.map((note) => <article className="wrong-note" key={note.question_id + '-' + note.answered_at}><div><p className="card-label">{note.topic_name}</p><h3>{note.question_text}</h3><small>{note.summary_text}</small></div><div className="wrong-note-actions"><button onClick={() => retrySame(note)}>다시 풀기 →</button><button className="outline-button" onClick={() => retry(note.question_id)}>비슷한 문제 풀기</button></div></article>) : <p className="empty">아직 저장된 오답이 없습니다. 문제를 풀어보세요.</p>}</section> }

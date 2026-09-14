@@ -24,6 +24,18 @@ class Settings(BaseSettings):
     # Used automatically while OLLAMA_MODEL (e.g. a cloud model) is over its usage limit; the primary is retried after the cooldown.
     ollama_fallback_model: str | None = None
     ollama_fallback_minutes: int = 60
+    # Models offered in the question-generation model picker, as "provider:model" entries.
+    # Gemini entries are hidden while GEMINI_API_KEY is empty.
+    # Each Gemini model has its own free-tier daily allowance, so several are offered to switch between.
+    selectable_models: list[str] = [
+        "gemini:gemini-3.6-flash",
+        "gemini:gemini-3.5-flash",
+        "gemini:gemini-3.5-flash-lite",
+        "gemini:gemini-3-flash-preview",
+        "gemini:gemini-3.1-flash-lite",
+        "ollama:qwen3.5:9b",
+        "ollama:qwen3.5:4b",
+    ]
     jwt_secret_key: str = INSECURE_JWT_SECRET
     jwt_algorithm: str = "HS256"
     jwt_expire_minutes: int = 60 * 24 * 7

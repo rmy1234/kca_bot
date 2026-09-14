@@ -36,9 +36,15 @@ def _item(topic_id, text):
     return _QuestionItem(topic_id=topic_id, question=text, choices=["a", "b", "c", "d"], answer_index=0, explanation="해설", difficulty=1)
 
 
-def _api_error(code, retry_delay=None, message="error"):
+def _api_error(code, retry_delay=None, message="error", quota_id=None):
     details = [{"@type": "type.googleapis.com/google.rpc.RetryInfo", "retryDelay": retry_delay}] if retry_delay else []
+    if quota_id:
+        details.append({"@type": "type.googleapis.com/google.rpc.QuotaFailure", "violations": [{"quotaId": quota_id, "quotaValue": "20"}]})
     return errors.APIError(code, {"error": {"code": code, "message": message, "status": "ERROR", "details": details}})
+
+
+# The payload Gemini returns once the free tier's daily allowance for a model is spent.
+DAILY_QUOTA_ID = "GenerateRequestsPerDayPerProjectPerModel-FreeTier"
 
 
 class _Payload(BaseModel):
@@ -143,11 +149,47 @@ def test_generate_structured_retries_once_after_rate_limit(fake_gemini):
     assert sleeps == [12.0]
 
 
-def test_generate_structured_retries_overload_with_default_wait(fake_gemini):
+def test_generate_structured_retries_overload_with_backoff(fake_gemini):
     install, sleeps = fake_gemini
     install([_api_error(503), _response('{"ok": true}')])
     assert _call_structured().ok
-    assert sleeps == [llm.DEFAULT_RETRY_WAIT_SECONDS]
+    assert sleeps == [llm.OVERLOAD_BACKOFF_SECONDS[0]]
+
+
+def test_generate_structured_rides_out_a_second_overload(fake_gemini):
+    install, sleeps = fake_gemini
+    models = install([_api_error(503), _api_error(503), _response('{"ok": true}')])
+    assert _call_structured().ok
+    assert models.calls == 3
+    assert sleeps == list(llm.OVERLOAD_BACKOFF_SECONDS)
+
+
+def test_generate_structured_gives_up_after_repeated_overload(fake_gemini):
+    install, sleeps = fake_gemini
+    models = install([_api_error(503), _api_error(503), _api_error(503)])
+    with pytest.raises(LLMUnavailableError) as caught:
+        _call_structured()
+    assert caught.value.code == 503
+    assert models.calls == 3
+    assert sleeps == list(llm.OVERLOAD_BACKOFF_SECONDS)
+
+
+def test_generate_structured_fails_fast_when_the_daily_quota_is_spent(fake_gemini):
+    install, sleeps = fake_gemini
+    models = install([_api_error(429, retry_delay="31s", quota_id=DAILY_QUOTA_ID)])
+    with pytest.raises(LLMUnavailableError) as caught:
+        _call_structured()
+    # Waiting out a per-day quota inside the request would stall it for nothing.
+    assert models.calls == 1
+    assert sleeps == []
+    assert "무료 호출을 모두 사용했습니다" in caught.value.user_message
+
+
+def test_per_minute_rate_limit_is_still_retried(fake_gemini):
+    install, sleeps = fake_gemini
+    install([_api_error(429, retry_delay="12s", quota_id="GenerateRequestsPerMinutePerProjectPerModel-FreeTier"), _response('{"ok": true}')])
+    assert _call_structured().ok
+    assert sleeps == [12.0]
 
 
 def test_generate_structured_gives_up_after_second_rate_limit(fake_gemini):

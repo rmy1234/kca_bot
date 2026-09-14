@@ -16,11 +16,11 @@ from app.core.config import get_settings
 from app.db.base import Base
 from app.db.models import Domain, GenerationLog, Question, ReferenceQuestion, ReviewSchedule, SourceDocument, Subject, Topic, TopicEmbedding, User, UserAnswerLog, UserEssayAnswer
 from app.db.session import AsyncSessionLocal, engine
-from app.llm import LLMUnavailableError, QuestionRequest, get_question_generator, llm_backend, llm_status, model_label, verify_questions
+from app.llm import LLMUnavailableError, QuestionRequest, get_question_generator, llm_backend, llm_status, model_label, resolve_model_choice, selectable_models, verify_questions
 from app.rag import CONTEXT_CHAR_BUDGET, MIN_TOPIC_CONTEXT_CHARS, is_duplicate_question, retrieve_context, retrieve_reference_questions
 from app.schemas import (
     AccuracyStat, AnswerRequest, AnswerResponse, DomainTopicsResponse,
-    GenerateQuestionsRequest, GenerateQuestionsResponse, LLMStatusResponse, PoolQuestionResponse, QuestionResponse, StatsResponse,
+    GenerateQuestionsRequest, GenerateQuestionsResponse, LLMStatusResponse, ModelOptionResponse, PoolQuestionResponse, QuestionResponse, StatsResponse,
     SubjectResponse, WrongNoteResponse, ReviewQueueItem,
     EssayFeedbackResponse, EssayHistoryItem, EssayQuestionResponse, EssaySubmitRequest,
     AdminTopicRequest, DocumentDetailResponse, DocumentEmbeddingResponse, ReassignEmbeddingRequest,
@@ -120,15 +120,27 @@ def allocate_question_counts(topics: list[Topic], count: int) -> list[tuple[Topi
 async def get_llm_status(current_user: User = Depends(get_current_user)):
     return llm_status()
 
+@app.get("/llm/models", response_model=list[ModelOptionResponse], tags=["llm"])
+async def get_llm_models(current_user: User = Depends(get_current_user)):
+    default_label = model_label()
+    return [
+        ModelOptionResponse(key=choice.key, provider=choice.provider, model=choice.model, is_default=f"{choice.provider}:{choice.model}" == default_label)
+        for choice in selectable_models()
+    ]
+
 def llm_unavailable(exc: LLMUnavailableError) -> HTTPException:
     if exc.user_message:
         return HTTPException(exc.code, exc.user_message)
     if exc.code == 429:
         return HTTPException(429, f"Gemini 무료 요청 한도(분당 요청 수)를 초과했습니다. 약 {math.ceil(exc.retry_after)}초 후 다시 시도하세요.")
-    return HTTPException(503, "Gemini 모델에 요청이 몰려 일시적으로 응답하지 못했습니다. 잠시 후 다시 시도하세요.")
+    return HTTPException(503, "Gemini 모델에 요청이 몰려 일시적으로 응답하지 못했습니다. 잠시 후 다시 시도하거나 생성 모델을 로컬 모델로 바꿔보세요.")
 
 @app.post("/questions/generate", response_model=GenerateQuestionsResponse, tags=["questions"])
 async def generate_questions(request: GenerateQuestionsRequest, db: AsyncSession = Depends(db_session)):
+    try:
+        choice = resolve_model_choice(request.model_key)
+    except ValueError as exc:
+        raise HTTPException(422, str(exc)) from exc
     if request.subject_id is not None:
         if not await db.get(Subject, request.subject_id):
             raise HTTPException(404, "Subject not found")
@@ -150,9 +162,9 @@ async def generate_questions(request: GenerateQuestionsRequest, db: AsyncSession
         requests.append(QuestionRequest(topic=topic, count=count, context=context, references=references))
     # One generation call and one verification call per request, whatever the count, to fit the free-tier rate limit.
     try:
-        generated = await get_question_generator().generate(requests)
+        generated = await get_question_generator(choice).generate(requests, choice)
         # Captured now: a later verification call may switch to the fallback model.
-        generation_model = model_label()
+        generation_model = model_label(choice)
     except RuntimeError as exc:
         for item in requests:
             db.add(GenerationLog(topic_id=item.topic.id, status="rejected", reject_reason=f"generation_failed: {exc}"[:1000]))
@@ -161,7 +173,7 @@ async def generate_questions(request: GenerateQuestionsRequest, db: AsyncSession
             raise llm_unavailable(exc) from exc
         raise HTTPException(502, "문제 생성에 실패했습니다. 잠시 후 다시 시도하세요.") from exc
     topics_by_id = {item.topic.id: item.topic for item in requests}
-    verdicts = await verify_questions([(topics_by_id[item.topic_id], item) for item in generated])
+    verdicts = await verify_questions([(topics_by_id[item.topic_id], item) for item in generated], choice)
     questions, rejected, unverified = [], 0, 0
     for item, (verdict, reason) in zip(generated, verdicts):
         if verdict == "invalid":
@@ -177,7 +189,7 @@ async def generate_questions(request: GenerateQuestionsRequest, db: AsyncSession
         # A failed verification call keeps the question, flagged so the user can double-check it.
         verification_status = "verified" if verdict == "valid" else "unverified"
         unverified += verification_status == "unverified"
-        question = Question(topic_id=item.topic_id, question_text=item.question, choices=item.choices, answer_index=item.answer_index, explanation=item.explanation, difficulty=item.difficulty, source=f"{llm_backend()}://question-generator", model_version=generation_model, quality_score=1.0, verification_status=verification_status)
+        question = Question(topic_id=item.topic_id, question_text=item.question, choices=item.choices, answer_index=item.answer_index, explanation=item.explanation, difficulty=item.difficulty, source=f"{choice.provider if choice else llm_backend()}://question-generator", model_version=generation_model, quality_score=1.0, verification_status=verification_status)
         db.add(question)
         questions.append(question)
         db.add(GenerationLog(topic_id=item.topic_id, status="accepted" if verification_status == "verified" else "unverified", reject_reason=reason[:1000] if reason else None))

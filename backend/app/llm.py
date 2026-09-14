@@ -32,11 +32,19 @@ class QuestionRequest:
     context: list[str] = field(default_factory=list)
     references: list[str] = field(default_factory=list)
 
+@dataclass(frozen=True)
+class ModelChoice:
+    """One entry of SELECTABLE_MODELS: an explicit provider/model the caller asked to generate with."""
+    key: str
+    provider: str
+    model: str
+
+
 class QuestionGenerator(Protocol):
-    async def generate(self, requests: list[QuestionRequest]) -> list[GeneratedQuestion]: ...
+    async def generate(self, requests: list[QuestionRequest], choice: "ModelChoice | None" = None) -> list[GeneratedQuestion]: ...
 
 class MockQuestionGenerator:
-    async def generate(self, requests: list[QuestionRequest]) -> list[GeneratedQuestion]:
+    async def generate(self, requests: list[QuestionRequest], choice: "ModelChoice | None" = None) -> list[GeneratedQuestion]:
         prompt_context = build_question_prompt(requests)
         questions = []
         for request in requests:
@@ -54,7 +62,34 @@ def llm_backend() -> str:
     return "gemini" if settings.gemini_api_key else "mock"
 
 
-def model_label() -> str:
+def selectable_models() -> list[ModelChoice]:
+    """Models the caller may pick from, in SELECTABLE_MODELS order."""
+    settings = get_settings()
+    choices: list[ModelChoice] = []
+    for entry in settings.selectable_models:
+        provider, _, model = entry.partition(":")
+        # A Gemini entry without a key would fall through to the mock generator, so it is not offered.
+        if provider not in ("gemini", "ollama") or not model:
+            continue
+        if provider == "gemini" and not settings.gemini_api_key:
+            continue
+        choices.append(ModelChoice(key=entry, provider=provider, model=model))
+    return choices
+
+
+def resolve_model_choice(key: str | None) -> ModelChoice | None:
+    """None means "use the configured default provider"; an unknown key is rejected rather than guessed."""
+    if not key:
+        return None
+    for choice in selectable_models():
+        if choice.key == key:
+            return choice
+    raise ValueError(f"선택할 수 없는 모델입니다: {key}")
+
+
+def model_label(choice: ModelChoice | None = None) -> str:
+    if choice:
+        return f"{choice.provider}:{choice.model}"
     backend = llm_backend()
     if backend == "ollama":
         return f"ollama:{active_ollama_model()}"
@@ -109,7 +144,10 @@ _llm_slots = asyncio.Semaphore(4)
 RETRYABLE_STATUS_CODES = {429, 503}
 # Free-tier 429 responses ask to wait about 30-50 seconds; wait only for the shorter ones to keep requests responsive.
 MAX_RETRY_WAIT_SECONDS = 35.0
-DEFAULT_RETRY_WAIT_SECONDS = 5.0
+# A 429 carries the server's own retryDelay, so it is honored once and then given up on.
+RATE_LIMIT_ATTEMPTS = 2
+# A 503 ("high demand") carries no retryDelay and usually clears within seconds, so back off on our own schedule.
+OVERLOAD_BACKOFF_SECONDS = (3.0, 8.0)
 
 
 def retry_delay_seconds(exc: errors.APIError) -> float | None:
@@ -125,6 +163,16 @@ def retry_delay_seconds(exc: errors.APIError) -> float | None:
     return float(match.group(1)) if match else None
 
 
+def is_daily_quota_exhausted(exc: errors.APIError) -> bool:
+    """A per-day free-tier quota lasts until the Pacific-midnight reset, so retrying within the request is pointless."""
+    details = exc.details if isinstance(exc.details, dict) else {}
+    for item in details.get("error", {}).get("details") or []:
+        for violation in (item.get("violations") or []) if isinstance(item, dict) else []:
+            if isinstance(violation, dict) and "PerDay" in str(violation.get("quotaId", "")):
+                return True
+    return False
+
+
 def get_gemini_client() -> genai.Client:
     global _client
     if _client is None:
@@ -132,8 +180,9 @@ def get_gemini_client() -> genai.Client:
     return _client
 
 
-async def _gemini_generate(schema: type[BaseModel], prompt: str, max_output_tokens: int, thinking_level: types.ThinkingLevel) -> str:
+async def _gemini_generate(schema: type[BaseModel], prompt: str, max_output_tokens: int, thinking_level: types.ThinkingLevel, model: str | None = None) -> str:
     settings = get_settings()
+    model = model or settings.llm_model
     config = types.GenerateContentConfig(
         response_mime_type="application/json",
         response_json_schema=schema.model_json_schema(),
@@ -142,19 +191,34 @@ async def _gemini_generate(schema: type[BaseModel], prompt: str, max_output_toke
         max_output_tokens=max_output_tokens,
         thinking_config=types.ThinkingConfig(thinking_level=thinking_level),
     )
-    for attempt in range(2):
+    attempt = 0
+    while True:
         try:
             async with _llm_slots:
-                response = await get_gemini_client().aio.models.generate_content(model=settings.llm_model, contents=prompt, config=config)
+                response = await get_gemini_client().aio.models.generate_content(model=model, contents=prompt, config=config)
             break
         except errors.APIError as exc:
             if exc.code not in RETRYABLE_STATUS_CODES:
                 raise RuntimeError(f"Gemini request failed: {exc}") from exc
-            delay = retry_delay_seconds(exc) or DEFAULT_RETRY_WAIT_SECONDS
-            if attempt == 1 or delay > MAX_RETRY_WAIT_SECONDS:
+            if is_daily_quota_exhausted(exc):
+                raise LLMUnavailableError(
+                    f"Gemini daily free-tier quota exhausted: {exc}",
+                    code=429,
+                    retry_after=0,
+                    user_message=f"오늘 쓸 수 있는 '{model}' 무료 호출을 모두 사용했습니다. 생성 모델을 다른 모델로 바꾸거나, 한도가 초기화되는 태평양 시간 자정(한국 시간 오후 4~5시) 이후에 다시 시도하세요.",
+                ) from exc
+            hinted = retry_delay_seconds(exc)
+            if hinted is None:
+                delay = OVERLOAD_BACKOFF_SECONDS[min(attempt, len(OVERLOAD_BACKOFF_SECONDS) - 1)]
+                exhausted = attempt >= len(OVERLOAD_BACKOFF_SECONDS)
+            else:
+                delay = hinted
+                exhausted = attempt >= RATE_LIMIT_ATTEMPTS - 1
+            if exhausted or delay > MAX_RETRY_WAIT_SECONDS:
                 raise LLMUnavailableError(f"Gemini request failed: {exc}", code=exc.code, retry_after=delay) from exc
             # Wait outside the concurrency slot so other calls are not blocked meanwhile.
             await asyncio.sleep(delay)
+            attempt += 1
     finish_reason = response.candidates[0].finish_reason if response.candidates else None
     if finish_reason == types.FinishReason.MAX_TOKENS:
         raise RuntimeError(f"Gemini response hit max_output_tokens ({max_output_tokens}) before completing the JSON payload")
@@ -177,9 +241,12 @@ def _ollama_client(settings: Settings) -> httpx.AsyncClient:
     return httpx.AsyncClient(base_url=settings.ollama_base_url, timeout=settings.ollama_timeout_seconds)
 
 
-async def _ollama_generate(schema: type[BaseModel], prompt: str, max_output_tokens: int) -> str:
+async def _ollama_generate(schema: type[BaseModel], prompt: str, max_output_tokens: int, model: str | None = None) -> str:
     global _fallback_until, _fallback_reason
     settings = get_settings()
+    if model is not None:
+        # An explicitly picked model is used as asked; the automatic fallback only manages the configured default.
+        return await _ollama_request(model, schema, prompt, max_output_tokens)
     model = active_ollama_model()
     fallback = settings.ollama_fallback_model
     try:
@@ -240,11 +307,14 @@ async def generate_structured(
     *,
     max_output_tokens: int,
     thinking_level: types.ThinkingLevel = types.ThinkingLevel.LOW,
+    choice: ModelChoice | None = None,
 ) -> _SchemaT:
-    if llm_backend() == "ollama":
-        text = await _ollama_generate(schema, prompt, max_output_tokens)
+    provider = choice.provider if choice else llm_backend()
+    model = choice.model if choice else None
+    if provider == "ollama":
+        text = await _ollama_generate(schema, prompt, max_output_tokens, model)
     else:
-        text = await _gemini_generate(schema, prompt, max_output_tokens, thinking_level)
+        text = await _gemini_generate(schema, prompt, max_output_tokens, thinking_level, model)
     try:
         return schema.model_validate_json(extract_json_object(text))
     except (ValidationError, ValueError) as exc:
@@ -279,14 +349,17 @@ def collect_generated(items: list[_QuestionItem], requests: list[QuestionRequest
 class StructuredQuestionGenerator:
     """Generates questions for every requested Topic in a single call to the configured LLM."""
 
-    async def generate(self, requests: list[QuestionRequest]) -> list[GeneratedQuestion]:
+    async def generate(self, requests: list[QuestionRequest], choice: ModelChoice | None = None) -> list[GeneratedQuestion]:
         # Up to 10 questions with explanations plus thinking must fit in one response.
-        batch = await generate_structured(_QuestionBatch, build_question_prompt(requests), max_output_tokens=32768, thinking_level=types.ThinkingLevel.MEDIUM)
+        batch = await generate_structured(_QuestionBatch, build_question_prompt(requests), max_output_tokens=32768, thinking_level=types.ThinkingLevel.MEDIUM, choice=choice)
         return collect_generated(batch.questions, requests)
 
 
-def get_question_generator() -> QuestionGenerator:
-    return MockQuestionGenerator() if llm_backend() == "mock" else StructuredQuestionGenerator()
+def get_question_generator(choice: ModelChoice | None = None) -> QuestionGenerator:
+    # An explicit choice always names a real backend, so the mock only stands in for an unconfigured default.
+    if choice is None and llm_backend() == "mock":
+        return MockQuestionGenerator()
+    return StructuredQuestionGenerator()
 
 
 class _VerificationItem(BaseModel):
@@ -312,14 +385,14 @@ def structural_problem(question: GeneratedQuestion) -> str | None:
     return None
 
 
-async def verify_questions(items: list[tuple[Topic, GeneratedQuestion]]) -> list[Verdict]:
+async def verify_questions(items: list[tuple[Topic, GeneratedQuestion]], choice: ModelChoice | None = None) -> list[Verdict]:
     """Return ("valid" | "invalid" | "unverified", reason) per item, using at most one LLM call.
 
     "unverified" means the verification call itself failed (for example a rate limit), not that the question is wrong.
     """
     verdicts: list[Verdict | None] = []
     pending = []
-    use_llm = llm_backend() != "mock"
+    use_llm = choice is not None or llm_backend() != "mock"
     for index, (topic, question) in enumerate(items):
         problem = structural_problem(question)
         if problem:
@@ -331,7 +404,7 @@ async def verify_questions(items: list[tuple[Topic, GeneratedQuestion]]) -> list
             pending.append((index, topic, question))
     if pending:
         try:
-            batch = await generate_structured(_VerificationBatch, build_verification_prompt(pending), max_output_tokens=8192)
+            batch = await generate_structured(_VerificationBatch, build_verification_prompt(pending), max_output_tokens=8192, choice=choice)
         except RuntimeError as exc:
             results, missing_reason = {}, f"verification_call_failed: {exc}"
         else:
