@@ -36,6 +36,11 @@ class Settings(BaseSettings):
         "ollama:qwen3.5:9b",
         "ollama:qwen3.5:4b",
     ]
+    # Self-service signup is off by default: an open form on a reachable port lets anyone create an
+    # account and spend LLM quota. Turn it on only while you actually need to add a learner.
+    registration_open: bool = False
+    # Per-user cap on the endpoints that call the LLM, so one account cannot drain the daily quota.
+    llm_requests_per_hour: int = 30
     jwt_secret_key: str = INSECURE_JWT_SECRET
     jwt_algorithm: str = "HS256"
     jwt_expire_minutes: int = 60 * 24 * 7

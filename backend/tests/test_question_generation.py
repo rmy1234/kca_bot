@@ -59,3 +59,9 @@ def test_pool_all_puts_unanswered_first_and_respects_limit():
     picked = select_pool_questions(_questions(6), {1: True, 2: False, 3: True}, "all", 4)
     assert len(picked) == 4
     assert {question.id for question in picked[:3]} == {4, 5, 6}
+
+
+def test_pool_without_limit_returns_every_match():
+    picked = select_pool_questions(_questions(30), {1: True}, "all", None)
+    assert len(picked) == 30
+    assert {question.id for question in picked} == set(range(1, 31))

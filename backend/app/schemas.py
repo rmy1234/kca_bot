@@ -1,5 +1,26 @@
 from datetime import date, datetime
-from pydantic import BaseModel, ConfigDict, EmailStr, Field, model_validator
+from pydantic import BaseModel, ConfigDict, EmailStr, Field, field_validator, model_validator
+
+# Passwords chosen through the API must resist guessing. The admin account is seeded straight from
+# ADMIN_PASSWORD and never passes through here, so this policy applies to ordinary accounts only.
+WEAK_PASSWORDS = {
+    "password", "password1", "password123", "12345678", "123456789", "1234567890",
+    "qwerty123", "qwertyui", "1q2w3e4r", "admin123", "administrator", "iloveyou",
+    "letmein1", "welcome1", "abcd1234", "a1234567", "11111111", "00000000",
+}
+
+
+def validate_password_strength(password: str) -> str:
+    if not any(char.isalpha() for char in password):
+        raise ValueError("비밀번호에 영문자를 1자 이상 포함하세요.")
+    if not any(char.isdigit() for char in password):
+        raise ValueError("비밀번호에 숫자를 1자 이상 포함하세요.")
+    if password.lower() in WEAK_PASSWORDS:
+        raise ValueError("너무 흔히 쓰이는 비밀번호입니다. 다른 비밀번호를 사용하세요.")
+    # Blocks "aaaaaaa1" and similar: long enough to pass the length check, but trivial to guess.
+    if len(set(password)) < 5:
+        raise ValueError("비밀번호에 서로 다른 문자를 5종류 이상 사용하세요.")
+    return password
 
 class SubjectResponse(BaseModel):
     model_config = ConfigDict(from_attributes=True)
@@ -51,6 +72,16 @@ class QuestionResponse(BaseModel):
 
 class PoolQuestionResponse(QuestionResponse):
     last_is_correct: bool | None = None
+
+class ReverifyRequest(BaseModel):
+    # One verification call covers the whole batch, so the cap keeps the prompt inside the model's context window.
+    limit: int = Field(20, ge=1, le=50)
+    model_key: str | None = Field(default=None, max_length=120)
+
+class ReverifyResponse(BaseModel):
+    checked: int
+    passed: int
+    failed: int
 
 class ModelOptionResponse(BaseModel):
     key: str
@@ -208,6 +239,11 @@ class RegisterRequest(BaseModel):
     password: str = Field(min_length=8, max_length=200)
     name: str = Field(min_length=1, max_length=120)
 
+    @field_validator("password")
+    @classmethod
+    def check_password_strength(cls, value: str) -> str:
+        return validate_password_strength(value)
+
 
 class LoginRequest(BaseModel):
     email: EmailStr
@@ -233,3 +269,8 @@ class UpdateProfileRequest(BaseModel):
     new_password: str | None = Field(None, min_length=8, max_length=200)
     # Required to confirm an email or password change; not needed for a name-only update.
     current_password: str | None = None
+
+    @field_validator("new_password")
+    @classmethod
+    def check_password_strength(cls, value: str | None) -> str | None:
+        return None if value is None else validate_password_strength(value)

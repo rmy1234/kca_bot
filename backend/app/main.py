@@ -5,22 +5,22 @@ import math
 import random
 from typing import AsyncIterator, Literal
 
-from fastapi import BackgroundTasks, Depends, FastAPI, File, Form, HTTPException, UploadFile
+from fastapi import BackgroundTasks, Depends, FastAPI, File, Form, HTTPException, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
-from app.auth import create_access_token, get_current_user, hash_password, require_admin, verify_password
+from app.auth import clear_login_failures, create_access_token, get_current_user, hash_password, login_retry_after, record_login_failure, require_admin, verify_password, verify_password_constant_time
 from app.core.config import get_settings
 from app.db.base import Base
 from app.db.models import Domain, GenerationLog, Question, ReferenceQuestion, ReviewSchedule, SourceDocument, Subject, Topic, TopicEmbedding, User, UserAnswerLog, UserEssayAnswer
 from app.db.session import AsyncSessionLocal, engine
-from app.llm import LLMUnavailableError, QuestionRequest, get_question_generator, llm_backend, llm_status, model_label, resolve_model_choice, selectable_models, verify_questions
+from app.llm import GeneratedQuestion, LLMUnavailableError, QuestionRequest, get_question_generator, llm_backend, llm_status, model_label, resolve_model_choice, selectable_models, verify_questions
 from app.rag import CONTEXT_CHAR_BUDGET, MIN_TOPIC_CONTEXT_CHARS, is_duplicate_question, retrieve_context, retrieve_reference_questions
 from app.schemas import (
     AccuracyStat, AnswerRequest, AnswerResponse, DomainTopicsResponse,
-    GenerateQuestionsRequest, GenerateQuestionsResponse, LLMStatusResponse, ModelOptionResponse, PoolQuestionResponse, QuestionResponse, StatsResponse,
+    GenerateQuestionsRequest, GenerateQuestionsResponse, LLMStatusResponse, ModelOptionResponse, PoolQuestionResponse, QuestionResponse, ReverifyRequest, ReverifyResponse, StatsResponse,
     SubjectResponse, WrongNoteResponse, ReviewQueueItem,
     EssayFeedbackResponse, EssayHistoryItem, EssayQuestionResponse, EssaySubmitRequest,
     AdminTopicRequest, DocumentDetailResponse, DocumentEmbeddingResponse, ReassignEmbeddingRequest,
@@ -29,6 +29,7 @@ from app.schemas import (
 )
 from app.seed import seed_curriculum
 from app.srs.sm2 import SM2State, update_sm2
+from app.throttle import SlidingWindowLimiter
 from app.essay import DISCLAIMER, get_essay_llm
 from app.ingestion import ALLOWED_DOC_TYPES, MAX_UPLOAD_BYTES, process_document, regenerate_summary_embeddings, reprocess_document, validate_upload
 
@@ -56,6 +57,8 @@ async def health_check():
 
 @app.post("/auth/register", response_model=TokenResponse, tags=["auth"])
 async def register(request: RegisterRequest, db: AsyncSession = Depends(db_session)):
+    if not settings.registration_open:
+        raise HTTPException(403, "신규 가입이 비활성화되어 있습니다. 관리자에게 문의하세요.")
     if await db.scalar(select(User).where(User.email == request.email)):
         raise HTTPException(409, "Email already registered")
     user = User(name=request.name, email=request.email, password_hash=hash_password(request.password))
@@ -65,10 +68,16 @@ async def register(request: RegisterRequest, db: AsyncSession = Depends(db_sessi
     return TokenResponse(access_token=create_access_token(user.id))
 
 @app.post("/auth/login", response_model=TokenResponse, tags=["auth"])
-async def login(request: LoginRequest, db: AsyncSession = Depends(db_session)):
+async def login(request: LoginRequest, http_request: Request, db: AsyncSession = Depends(db_session)):
+    client_ip = http_request.client.host if http_request.client else "unknown"
+    wait_seconds = login_retry_after(request.email, client_ip)
+    if wait_seconds > 0:
+        raise HTTPException(429, f"로그인 시도가 너무 많습니다. 약 {math.ceil(wait_seconds)}초 후 다시 시도하세요.")
     user = await db.scalar(select(User).where(User.email == request.email))
-    if not user or not user.password_hash or not verify_password(request.password, user.password_hash):
+    if not verify_password_constant_time(request.password, user.password_hash if user else None):
+        record_login_failure(request.email, client_ip)
         raise HTTPException(401, "Invalid email or password")
+    clear_login_failures(request.email, client_ip)
     return TokenResponse(access_token=create_access_token(user.id))
 
 @app.get("/auth/me", response_model=UserResponse, tags=["auth"])
@@ -128,6 +137,15 @@ async def get_llm_models(current_user: User = Depends(get_current_user)):
         for choice in selectable_models()
     ]
 
+_llm_limiter = SlidingWindowLimiter(settings.llm_requests_per_hour, 3600.0)
+
+async def llm_quota_guard(current_user: User = Depends(get_current_user)) -> User:
+    """Authenticates, then spends one of this account's hourly LLM-request allowance."""
+    wait_seconds = _llm_limiter.consume(str(current_user.id))
+    if wait_seconds > 0:
+        raise HTTPException(429, f"시간당 AI 호출 한도({settings.llm_requests_per_hour}회)를 모두 사용했습니다. 약 {math.ceil(wait_seconds / 60)}분 후 다시 시도하세요.")
+    return current_user
+
 def llm_unavailable(exc: LLMUnavailableError) -> HTTPException:
     if exc.user_message:
         return HTTPException(exc.code, exc.user_message)
@@ -136,7 +154,7 @@ def llm_unavailable(exc: LLMUnavailableError) -> HTTPException:
     return HTTPException(503, "Gemini 모델에 요청이 몰려 일시적으로 응답하지 못했습니다. 잠시 후 다시 시도하거나 생성 모델을 로컬 모델로 바꿔보세요.")
 
 @app.post("/questions/generate", response_model=GenerateQuestionsResponse, tags=["questions"])
-async def generate_questions(request: GenerateQuestionsRequest, db: AsyncSession = Depends(db_session)):
+async def generate_questions(request: GenerateQuestionsRequest, db: AsyncSession = Depends(db_session), _user: User = Depends(llm_quota_guard)):
     try:
         choice = resolve_model_choice(request.model_key)
     except ValueError as exc:
@@ -186,12 +204,14 @@ async def generate_questions(request: GenerateQuestionsRequest, db: AsyncSession
             rejected += 1
             db.add(GenerationLog(topic_id=item.topic_id, status="rejected", reject_reason=f"duplicate_similarity={similarity}"))
             continue
-        # A failed verification call keeps the question, flagged so the user can double-check it.
+        # A failed verification call keeps the question stored so POST /questions/reverify can rescue it later,
+        # but only verified questions are handed to the learner.
         verification_status = "verified" if verdict == "valid" else "unverified"
         unverified += verification_status == "unverified"
         question = Question(topic_id=item.topic_id, question_text=item.question, choices=item.choices, answer_index=item.answer_index, explanation=item.explanation, difficulty=item.difficulty, source=f"{choice.provider if choice else llm_backend()}://question-generator", model_version=generation_model, quality_score=1.0, verification_status=verification_status)
         db.add(question)
-        questions.append(question)
+        if verification_status == "verified":
+            questions.append(question)
         db.add(GenerationLog(topic_id=item.topic_id, status="accepted" if verification_status == "verified" else "unverified", reject_reason=reason[:1000] if reason else None))
     await db.commit()
     for question in questions:
@@ -356,8 +376,12 @@ async def create_reference_question(request: ReferenceQuestionRequest, db: Async
 
 PoolStatus = Literal["all", "unanswered", "wrong"]
 
-def select_pool_questions(questions: list[Question], last_results: dict[int, bool], status: PoolStatus, limit: int) -> list[Question]:
-    """Pick saved questions by the user's latest attempt: unanswered, last answered wrong, or all (unanswered first)."""
+def select_pool_questions(questions: list[Question], last_results: dict[int, bool], status: PoolStatus, limit: int | None) -> list[Question]:
+    """Pick saved questions by the user's latest attempt: unanswered, last answered wrong, or all (unanswered first).
+
+    limit=None returns every match so the caller can page through them itself; paging on the server
+    would reshuffle between requests and make a question appear twice or not at all.
+    """
     if status == "unanswered":
         picked = [question for question in questions if question.id not in last_results]
     elif status == "wrong":
@@ -367,16 +391,18 @@ def select_pool_questions(questions: list[Question], last_results: dict[int, boo
     random.shuffle(picked)
     if status == "all":
         picked.sort(key=lambda question: question.id in last_results)
-    return picked[:limit]
+    return picked if limit is None else picked[:limit]
 
 @app.get("/questions/pool", response_model=list[PoolQuestionResponse], tags=["questions"])
-async def question_pool(topic_id: int | None = None, subject_id: int | None = None, status: PoolStatus = "all", limit: int = 10, db: AsyncSession = Depends(db_session), current_user: User = Depends(get_current_user)):
-    if limit < 1 or limit > 50:
-        raise HTTPException(422, "limit must be between 1 and 50")
+async def question_pool(topic_id: int | None = None, subject_id: int | None = None, status: PoolStatus = "all", limit: int | None = None, db: AsyncSession = Depends(db_session), current_user: User = Depends(get_current_user)):
+    # Omitting limit returns every saved question for the scope; the client pages through them.
+    if limit is not None and (limit < 1 or limit > 500):
+        raise HTTPException(422, "limit must be between 1 and 500")
     if (topic_id is None) == (subject_id is None):
         raise HTTPException(422, "topic_id와 subject_id 중 하나만 지정하세요.")
     # Essay questions have no choices, so only multiple-choice questions can be re-solved here.
-    query = select(Question).where(Question.type == "multiple_choice")
+    # Questions whose AI verification never passed are withheld until they are re-verified.
+    query = select(Question).where(Question.type == "multiple_choice", Question.verification_status == "verified")
     if subject_id is not None:
         if not await db.get(Subject, subject_id):
             raise HTTPException(404, "Subject not found")
@@ -424,7 +450,7 @@ async def wrong_notes(db: AsyncSession = Depends(db_session), current_user: User
     return [WrongNoteResponse(question_id=log.question.id, question_text=log.question.question_text, choices=log.question.choices, selected_index=log.selected_index, answered_at=log.answered_at, topic_id=log.question.topic.id, topic_name=log.question.topic.name, summary_text=log.question.topic.summary_text) for log in logs]
 
 @app.post("/questions/{question_id}/regenerate-similar", response_model=list[QuestionResponse], tags=["questions"])
-async def regenerate_similar(question_id: int, db: AsyncSession = Depends(db_session)):
+async def regenerate_similar(question_id: int, db: AsyncSession = Depends(db_session), _user: User = Depends(llm_quota_guard)):
     question = await db.get(Question, question_id, options=[selectinload(Question.topic)])
     if not question:
         raise HTTPException(404, "Question not found")
@@ -433,13 +459,52 @@ async def regenerate_similar(question_id: int, db: AsyncSession = Depends(db_ses
         generation_model = model_label()
     except LLMUnavailableError as exc:
         raise llm_unavailable(exc) from exc
-    # Similar questions skip AI verification to save quota, so they are flagged as unverified.
-    questions = [Question(topic_id=question.topic_id, question_text=item.question, choices=item.choices, answer_index=item.answer_index, explanation=item.explanation, difficulty=item.difficulty, source=f"{llm_backend()}://similar-to/{question_id}", model_version=generation_model, quality_score=1.0, verification_status="unverified") for item in generated]
+    # Verified like a normal generation, so a similar question is never served without passing the same check.
+    verdicts = await verify_questions([(question.topic, item) for item in generated])
+    questions = [
+        Question(topic_id=question.topic_id, question_text=item.question, choices=item.choices, answer_index=item.answer_index, explanation=item.explanation, difficulty=item.difficulty, source=f"{llm_backend()}://similar-to/{question_id}", model_version=generation_model, quality_score=1.0, verification_status="verified" if verdict == "valid" else "unverified")
+        for item, (verdict, _) in zip(generated, verdicts)
+    ]
     db.add_all(questions)
     await db.commit()
     for item in questions:
         await db.refresh(item)
-    return questions
+    passed = [item for item in questions if item.verification_status == "verified"]
+    if not passed:
+        raise HTTPException(422, "생성한 문제가 AI 검증을 통과하지 못했습니다. 다시 시도하세요.")
+    return passed
+
+@app.post("/questions/reverify", response_model=ReverifyResponse, tags=["questions"])
+async def reverify_questions(request: ReverifyRequest, db: AsyncSession = Depends(db_session), _user: User = Depends(llm_quota_guard)):
+    """Re-run AI verification on stored questions whose earlier verification call failed."""
+    try:
+        choice = resolve_model_choice(request.model_key)
+    except ValueError as exc:
+        raise HTTPException(422, str(exc)) from exc
+    pending = (await db.scalars(
+        select(Question)
+        .where(Question.type == "multiple_choice", Question.verification_status == "unverified")
+        .options(selectinload(Question.topic))
+        .order_by(Question.id)
+        .limit(request.limit)
+    )).all()
+    if not pending:
+        return ReverifyResponse(checked=0, passed=0, failed=0)
+    items = [(item.topic, GeneratedQuestion(topic_id=item.topic_id, question=item.question_text, choices=item.choices, answer_index=item.answer_index, explanation=item.explanation, difficulty=item.difficulty)) for item in pending]
+    try:
+        verdicts = await verify_questions(items, choice)
+    except LLMUnavailableError as exc:
+        raise llm_unavailable(exc) from exc
+    passed = 0
+    for question, (verdict, reason) in zip(pending, verdicts):
+        if verdict == "valid":
+            question.verification_status = "verified"
+            passed += 1
+        else:
+            # Still withheld: either the model rejected it, or the verification call failed again.
+            db.add(GenerationLog(topic_id=question.topic_id, status="unverified", reject_reason=f"reverify: {reason}"[:1000] if reason else None))
+    await db.commit()
+    return ReverifyResponse(checked=len(pending), passed=passed, failed=len(pending) - passed)
 
 def first_attempts(logs: list[UserAnswerLog]) -> list[UserAnswerLog]:
     """Keep each question's first attempt so re-solving saved or wrong questions never changes accuracy. Expects logs in id order."""
@@ -477,7 +542,7 @@ async def user_stats(db: AsyncSession = Depends(db_session), current_user: User 
     return StatsResponse(subject_stats=subject_stats, domain_stats=domain_stats, recent_7_days_count=recent, weak_domains=weak)
 
 @app.post("/questions/{question_id}/report", tags=["questions"])
-async def report_question(question_id: int, db: AsyncSession = Depends(db_session)):
+async def report_question(question_id: int, db: AsyncSession = Depends(db_session), _user: User = Depends(get_current_user)):
     question = await db.get(Question, question_id)
     if not question:
         raise HTTPException(404, "Question not found")
@@ -515,7 +580,7 @@ async def review_queue(limit: int = 3, db: AsyncSession = Depends(db_session), c
         ))
     return items
 @app.get("/essay-questions/generate", response_model=EssayQuestionResponse, tags=["essay"])
-async def generate_essay_question(topic_id: int, db: AsyncSession = Depends(db_session)):
+async def generate_essay_question(topic_id: int, db: AsyncSession = Depends(db_session), _user: User = Depends(llm_quota_guard)):
     topic = await db.get(Topic, topic_id)
     if not topic:
         raise HTTPException(404, "Topic not found")
@@ -545,7 +610,7 @@ async def generate_essay_question(topic_id: int, db: AsyncSession = Depends(db_s
 
 
 @app.post("/essay-questions/{question_id}/submit", response_model=EssayFeedbackResponse, tags=["essay"])
-async def submit_essay(question_id: int, request: EssaySubmitRequest, db: AsyncSession = Depends(db_session), current_user: User = Depends(get_current_user)):
+async def submit_essay(question_id: int, request: EssaySubmitRequest, db: AsyncSession = Depends(db_session), current_user: User = Depends(llm_quota_guard)):
     question = await db.get(Question, question_id)
     if not question or question.exam_type != "실기":
         raise HTTPException(404, "Essay question not found")
